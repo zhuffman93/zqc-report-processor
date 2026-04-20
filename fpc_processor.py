@@ -33,7 +33,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -229,6 +229,8 @@ class FPCProcessorApp:
             variable=self.run_on_startup,
             command=self._on_startup_prefs_changed,
         )
+        settings_menu.add_separator()
+        settings_menu.add_command(label="Check for Updates", command=self.check_for_updates_manual)
         settings_menu.add_separator()
         settings_menu.add_command(label="View Log", command=self.toggle_log_window)
 
@@ -1460,20 +1462,39 @@ class FPCProcessorApp:
     # ── Auto-update methods ────────────────────────────────────────────────
 
     def _check_for_updates(self):
-        """Kick off a background thread to check GitHub for a newer release.
-        The check is skipped silently if 'requests' is not installed or if
-        the app is running as a plain .py script (not a compiled .exe)."""
+        """Startup auto-check: runs silently in background, only prompts if update found.
+        Skipped when running as a .py script (only the compiled .exe auto-updates)."""
         if _requests is None:
-            return  # requests not installed - feature disabled
-        # Only auto-update the compiled .exe; during dev the .py script is fine as-is
-        if not getattr(sys, 'frozen', False):
             return
-        t = threading.Thread(target=self._update_check_worker, daemon=True)
-        t.start()
+        if not getattr(sys, 'frozen', False):
+            return  # dev mode — skip auto-check, use Settings > Check for Updates instead
+        threading.Thread(
+            target=self._update_check_worker, kwargs={'silent': True}, daemon=True
+        ).start()
 
-    def _update_check_worker(self):
-        """Run in a background thread: hit the GitHub releases API and schedule
-        a UI callback on the main thread if a newer version is found."""
+    def check_for_updates_manual(self):
+        """Settings menu: manual check — works in both .exe and .py, shows result dialog."""
+        if _requests is None:
+            messagebox.showwarning(
+                "Update Check Unavailable",
+                "The 'requests' library is not installed.\n"
+                "Run:  pip install requests"
+            )
+            return
+        threading.Thread(
+            target=self._update_check_worker, kwargs={'silent': False}, daemon=True
+        ).start()
+
+    def _update_check_worker(self, silent: bool = True):
+        """Background thread: call the GitHub releases API and act on the result.
+
+        silent=True  — startup auto-check: swallow all errors, only show dialog if update found.
+        silent=False — manual check: always show a result dialog (update / up-to-date / error).
+        """
+        error_msg   = None
+        latest_tag  = None
+        asset_url   = None
+
         try:
             api_url = (
                 f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO_NAME}/releases/latest"
@@ -1483,32 +1504,47 @@ class FPCProcessorApp:
                 "Accept": "application/vnd.github+json",
             }
             resp = _requests.get(api_url, headers=headers, timeout=10)
-            if resp.status_code != 200:
-                return  # no release yet, or token/network issue - fail silently
 
-            data = resp.json()
-            latest_tag = data.get("tag_name", "").lstrip("v")
+            if resp.status_code == 401:
+                error_msg = "Authentication failed (HTTP 401).\nThe update token may have expired or been revoked."
+            elif resp.status_code == 404:
+                error_msg = "No releases found on GitHub yet."
+            elif resp.status_code != 200:
+                error_msg = f"GitHub API returned HTTP {resp.status_code}."
+            else:
+                data       = resp.json()
+                latest_tag = data.get("tag_name", "").lstrip("v")
+                for asset in data.get("assets", []):
+                    if asset["name"].lower().endswith(".exe"):
+                        asset_url = asset["url"]
+                        break
 
-            if not self._version_is_newer(latest_tag, VERSION):
-                return  # already up to date
+        except Exception as e:
+            error_msg = f"Network error: {e}"
 
-            # Find the .exe asset in the release
-            asset_url = None
-            for asset in data.get("assets", []):
-                if asset["name"].lower().endswith(".exe"):
-                    # For private repos we must use the API URL (not browser_download_url)
-                    # and include the auth header when downloading
-                    asset_url = asset["url"]
-                    break
+        # Schedule UI feedback on the main thread
+        if error_msg:
+            if not silent:
+                self.root.after(0, lambda: messagebox.showerror(
+                    "Update Check Failed", error_msg))
+            return
 
-            if not asset_url:
-                return  # release exists but no .exe attached yet
+        if not self._version_is_newer(latest_tag, VERSION):
+            if not silent:
+                self.root.after(0, lambda: messagebox.showinfo(
+                    "Up to Date",
+                    f"You are running the latest version ({VERSION})."))
+            return
 
-            # Schedule the update prompt on the main thread (safe from background threads)
-            self.root.after(0, lambda: self._prompt_update(latest_tag, asset_url))
+        if not asset_url:
+            if not silent:
+                self.root.after(0, lambda: messagebox.showwarning(
+                    "Update Available",
+                    f"Version {latest_tag} is available but the installer\n"
+                    f"has not been attached to the release yet."))
+            return
 
-        except Exception:
-            pass  # network unavailable, timeout, etc. - fail silently
+        self.root.after(0, lambda: self._prompt_update(latest_tag, asset_url))
 
     @staticmethod
     def _version_is_newer(latest: str, current: str) -> bool:

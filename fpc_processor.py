@@ -41,7 +41,7 @@ OVERWATCH_INTERVAL = 30
 # GitHub auto-update settings (private repo, read-only token)
 GITHUB_OWNER     = "zhuffman93"
 GITHUB_REPO_NAME = "lastrada-report-processor"
-GITHUB_TOKEN     = "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"
+GITHUB_TOKEN     = "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"
 
 # Config file location - persists settings between sessions
 CONFIG_PATH = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaReportProcessor' / 'config.json'

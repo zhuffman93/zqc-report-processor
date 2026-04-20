@@ -33,7 +33,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -58,8 +58,7 @@ LABS = [
 _ONEDRIVE_BASE = (
     Path.home()
     / "OneDrive - Shelly & Sands, Inc"
-    / "Mar-Zane Lab - Documents"
-    / "MZ Lab Tech Info"
+    / "Mar-Zane Lab - MZ Lab Tech Info"
     / "Plant Labs"
 )
 
@@ -258,6 +257,14 @@ class FPCProcessorApp:
             command=self.toggle_overwatch,
         )
         self.overwatch_btn.pack(side=tk.LEFT, padx=(0, 4), pady=2)
+
+        # Version label — right-aligned in the toolbar
+        self._version_lbl = ttk.Label(
+            self._toolbar,
+            text=f"v{VERSION}",
+            style='Toolbar.TLabel',
+        )
+        self._version_lbl.pack(side=tk.RIGHT, padx=(0, 8), pady=2)
 
         # ── Status bar — packed BOTTOM before content so it reserves space ──
         self.status_bar = ttk.Label(
@@ -565,6 +572,8 @@ class FPCProcessorApp:
         # --- Toolbar and its dropdown menu ---
         toolbar_bg = '#3a3a3a' if dark else '#e8e8e8'
         s.configure('Toolbar.TFrame', background=toolbar_bg)
+        s.configure('Toolbar.TLabel', background=toolbar_bg, foreground=t['fg'],
+                    font=('Segoe UI', 8))
         if hasattr(self, '_settings_menu'):
             self._settings_menu.configure(
                 background=t['entry_bg'], foreground=t['fg'],

@@ -1,0 +1,21 @@
+# Compiled output — distributed via GitHub Releases, not committed to source
+dist/
+build/
+*.spec
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# PyCharm project files
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db

@@ -15,7 +15,7 @@ import tkinter as tk
 import winreg
 from tkinter import filedialog, messagebox, ttk
 from pathlib import Path
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 from datetime import datetime
 
 try:
@@ -33,7 +33,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -46,6 +46,7 @@ GITHUB_TOKEN     = "[REDACTED-PAT]"
 # Config file location - persists settings between sessions
 CONFIG_PATH = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaReportProcessor' / 'config.json'
 STATS_PATH  = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaReportProcessor' / 'stats.json'
+MERGES_PATH = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaReportProcessor' / 'merges.json'
 
 # Labs available in the dropdown
 LABS = [
@@ -707,14 +708,27 @@ class FPCProcessorApp:
             status_text = 'Pending'
             tag = 'pending'
 
-            if info and all([info['project'], info['material'], info['jmf'],
-                             info['production_day'], info['date']]):
-                new_name = (
-                    f"{info['project']} {info['material']} {info['jmf']} "
-                    f"{info['production_day']} {info['date']}.pdf"
-                )
-                new_name = new_name.replace('Intermediate', 'Int')
-                new_name = new_name.replace('Surface', 'Sur')
+            pdf_type = info.get('pdf_type') if info else None
+
+            if pdf_type == 'jmf_adjustment':
+                required_ok = info and all([info['project'], info['jmf'], info['date']])
+            else:
+                required_ok = info and all([info['project'], info['material'], info['jmf'],
+                                            info['production_day'], info['date']])
+
+            if required_ok:
+                if pdf_type == 'jmf_adjustment':
+                    new_name = (
+                        f"{info['project']} {info['jmf']} {info['date']} "
+                        f"JMF Adjustment Letter.pdf"
+                    )
+                else:
+                    new_name = (
+                        f"{info['project']} {info['material']} {info['jmf']} "
+                        f"{info['production_day']} {info['date']}.pdf"
+                    )
+                    new_name = new_name.replace('Intermediate', 'Int')
+                    new_name = new_name.replace('Surface', 'Sur')
                 new_name = re.sub(r'[<>:"|?*]', '_', new_name)
                 status_text = 'Ready'
                 tag = 'ready'
@@ -725,9 +739,10 @@ class FPCProcessorApp:
                     missing.append("read error")
                 else:
                     if not info['project']: missing.append("project")
-                    if not info['material']: missing.append("material")
+                    if pdf_type != 'jmf_adjustment':
+                        if not info['material']: missing.append("material")
+                        if not info['production_day']: missing.append("production day")
                     if not info['jmf']: missing.append("JMF")
-                    if not info['production_day']: missing.append("production day")
                     if not info['date']: missing.append("date")
                 status_text = f"Missing: {', '.join(missing)}"
                 tag = 'error'
@@ -754,57 +769,195 @@ class FPCProcessorApp:
             self._set_process_buttons('normal')
     
     def extract_info_from_pdf(self, filepath):
-        """Extract metadata from PDF file"""
+        """Extract metadata from a PDF file.
+
+        Detects the document type from the first page and routes to the
+        appropriate extraction logic.  Always returns a dict with at least
+        a 'pdf_type' key, or None on read failure.
+
+        Supported types:
+          'jmf_adjustment' — Mar-Zane JMF Adjustment Letter
+          'lastrada'       — Shelly & Sands Lastrada QC report (default)
+        """
         try:
             reader = PdfReader(filepath)
-            
-            # Get text from first page
-            first_page = reader.pages[0]
-            text = first_page.extract_text()
-            
-            info = {
-                'project': '',
-                'material': '',
-                'jmf': '',
-                'production_day': '',
-                'date': ''
-            }
-            
-            # Extract Project (looking for "Project: X-XX" pattern)
-            project_match = re.search(r'Project:\s*(\d+-\d+)', text, re.IGNORECASE)
-            if project_match:
-                info['project'] = project_match.group(1).strip()
-            
-            # Extract Material (looking for "Material: XXmm Intermediate/Surface" but exclude "Quantity(Tons)")
-            material_match = re.search(r'Material:\s*([^\n]+?)(?:\s+Quantity\s*\(|$)', text, re.IGNORECASE)
-            if material_match:
-                # Clean up the material text - remove extra whitespace
-                info['material'] = ' '.join(material_match.group(1).split())
-            
-            # Extract JMF (looking for "JMF: BXXXXXX")
-            jmf_match = re.search(r'JMF:\s*([B]\d+)', text, re.IGNORECASE)
-            if jmf_match:
-                info['jmf'] = jmf_match.group(1).strip()
-            
-            # Extract Production Day (looking for "Production Day: X")
-            day_match = re.search(r'Production\s+Day:\s*(\d+)', text, re.IGNORECASE)
-            if day_match:
-                info['production_day'] = f"Day{day_match.group(1).strip()}"
-            
-            # Extract Date (looking for "Date Tested: XX/XX/XXXX" or "Date Sampled: XX/XX/XXXX")
-            date_match = re.search(r'Date\s+(?:Tested|Sampled):\s*(\d{1,2})/(\d{1,2})/(\d{4})', text, re.IGNORECASE)
-            if date_match:
-                month = date_match.group(1).zfill(2)
-                day = date_match.group(2).zfill(2)
-                year = date_match.group(3)
-                info['date'] = f"{month}-{day}-{year}"
-            
-            return info
-            
+            text = reader.pages[0].extract_text() or ""
+
+            if 'JMF Adjustment Letter' in text:
+                return self._extract_jmf_adjustment_info(text)
+            elif 'Mar-Zane Lab' in text:
+                return self._extract_pills_rice_info(text)
+            else:
+                return self._extract_lastrada_info(text)
+
         except Exception as e:
-            self.add_log(f"Error extracting from PDF: {str(e)}", "error")
+            self.add_log(f"Error reading PDF: {e}", "error")
             return None
+
+    def _extract_jmf_adjustment_info(self, text):
+        """Extract fields from a Mar-Zane JMF Adjustment Letter."""
+        info = {
+            'pdf_type':      'jmf_adjustment',
+            'project':       '',
+            'jmf':           '',
+            'date':          '',
+            # Unused by this type but kept so shared code doesn't KeyError
+            'material':      '',
+            'production_day': '',
+        }
+
+        # Project: 254-25
+        m = re.search(r'Project:\s*(\S+)', text, re.IGNORECASE)
+        if m:
+            info['project'] = m.group(1).strip()
+
+        # JMF = B240868
+        m = re.search(r'JMF\s*=\s*(B\d+)', text, re.IGNORECASE)
+        if m:
+            info['jmf'] = m.group(1).strip()
+
+        # Date: 04/21/2026
+        m = re.search(r'Date:\s*(\d{1,2})/(\d{1,2})/(\d{4})', text, re.IGNORECASE)
+        if m:
+            info['date'] = f"{m.group(1).zfill(2)}-{m.group(2).zfill(2)}-{m.group(3)}"
+
+        return info
+
+    def _extract_pills_rice_info(self, text):
+        """Extract fields from a Mar-Zane Lab Pills & Rice report (TE-220 / TE-221)."""
+        info = {
+            'pdf_type':      'pills_rice',
+            'project':       '',
+            'jmf':           '',
+            'material':      '',
+            'production_day': '',
+            'date':          '',
+        }
+
+        # Project Number: 287-25
+        m = re.search(r'Project\s+Number:\s*(\S+)', text, re.IGNORECASE)
+        if m:
+            info['project'] = m.group(1).strip()
+
+        # JMF Number: B260208
+        m = re.search(r'JMF\s+Number:\s*(B\d+)', text, re.IGNORECASE)
+        if m:
+            info['jmf'] = m.group(1).strip()
+
+        # Mix Type: Type 2 Intermediate  (stop before the next labelled field)
+        # Use \s* (zero or more spaces) because pypdf sometimes concatenates adjacent fields
+        # without whitespace (e.g. "IntermediateTest Number:1").
+        m = re.search(
+            r'Mix\s+Type:\s*(.+?)(?=\s*Test\s+Number|\s*Sample\s+Type|\s*Day\s+Number)',
+            text, re.IGNORECASE,
+        )
+        if m:
+            info['material'] = ' '.join(m.group(1).split())
+
+        # Day Number: 1
+        m = re.search(r'Day\s+Number:\s*(\d+)', text, re.IGNORECASE)
+        if m:
+            info['production_day'] = f"Day{m.group(1).strip()}"
+
+        # Date: 04/20/2026
+        m = re.search(r'Date:\s*(\d{1,2})/(\d{1,2})/(\d{4})', text, re.IGNORECASE)
+        if m:
+            info['date'] = f"{m.group(1).zfill(2)}-{m.group(2).zfill(2)}-{m.group(3)}"
+
+        return info
+
+    def _extract_lastrada_info(self, text):
+        """Extract fields from a Shelly & Sands Lastrada QC report."""
+        info = {
+            'pdf_type':      'lastrada',
+            'project':       '',
+            'material':      '',
+            'jmf':           '',
+            'production_day': '',
+            'date':          '',
+        }
+
+        # Project: X-XX
+        m = re.search(r'Project:\s*(\d+-\d+)', text, re.IGNORECASE)
+        if m:
+            info['project'] = m.group(1).strip()
+
+        # Material: XXmm Intermediate/Surface  (stop before "Quantity(")
+        m = re.search(r'Material:\s*([^\n]+?)(?:\s+Quantity\s*\(|$)', text, re.IGNORECASE)
+        if m:
+            info['material'] = ' '.join(m.group(1).split())
+
+        # JMF: BXXXXXX
+        m = re.search(r'JMF:\s*(B\d+)', text, re.IGNORECASE)
+        if m:
+            info['jmf'] = m.group(1).strip()
+
+        # Production Day: X
+        m = re.search(r'Production\s+Day:\s*(\d+)', text, re.IGNORECASE)
+        if m:
+            info['production_day'] = f"Day{m.group(1).strip()}"
+
+        # Date Tested / Date Sampled: MM/DD/YYYY
+        m = re.search(r'Date\s+(?:Tested|Sampled):\s*(\d{1,2})/(\d{1,2})/(\d{4})', text, re.IGNORECASE)
+        if m:
+            info['date'] = f"{m.group(1).zfill(2)}-{m.group(2).zfill(2)}-{m.group(3)}"
+
+        return info
     
+    def _is_already_merged(self, source_path: str, dest_path: Path) -> bool:
+        """Return True if this exact source file has already been merged into dest_path.
+        Uses source file size + destination path as a lightweight fingerprint."""
+        try:
+            if not MERGES_PATH.exists():
+                return False
+            with open(MERGES_PATH, 'r') as f:
+                merges = json.load(f)
+            source_size = os.path.getsize(source_path)
+            dest_str = str(dest_path)
+            return any(
+                m.get('source_size') == source_size and m.get('dest') == dest_str
+                for m in merges
+            )
+        except Exception:
+            return False  # if the log can't be read, allow the merge
+
+    def _record_merge(self, source_path: str, dest_path: Path):
+        """Record a successful Pills & Rice merge so future scans can skip it."""
+        try:
+            merges = []
+            if MERGES_PATH.exists():
+                with open(MERGES_PATH, 'r') as f:
+                    merges = json.load(f)
+            merges.append({
+                'source':      source_path,
+                'source_size': os.path.getsize(source_path),
+                'dest':        str(dest_path),
+                'merged_at':   datetime.now().isoformat(),
+            })
+            MERGES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(MERGES_PATH, 'w') as f:
+                json.dump(merges, f, indent=2)
+        except Exception:
+            pass  # merge log is non-critical
+
+    def _merge_pdfs(self, base_path: Path, append_path: str):
+        """Append all pages from append_path to the end of base_path, overwriting base_path.
+        Reads both files fully before writing so there is no conflict when paths overlap."""
+        writer = PdfWriter()
+        for page in PdfReader(str(base_path)).pages:
+            writer.add_page(page)
+        for page in PdfReader(str(append_path)).pages:
+            writer.add_page(page)
+        tmp = base_path.with_suffix('.mergetmp.pdf')
+        with open(tmp, 'wb') as fh:
+            writer.write(fh)
+        tmp.replace(base_path)  # atomic rename overwrites the original
+
+    def _ensure_project_subfolders(self, project_path: Path):
+        """Create the standard subfolders inside a project folder if they don't exist yet."""
+        for folder_name in ("Antistrip Reports", "Moistures", "Random Numbers"):
+            (project_path / folder_name).mkdir(parents=True, exist_ok=True)
+
     def _set_process_buttons(self, state):
         """Enable or disable both process buttons together"""
         self.process_btn.configure(state=state)
@@ -846,16 +999,24 @@ class FPCProcessorApp:
 
             # For successfully processed or skipped files, print the renamed destination copy
             if file_info['status'] in ('success', 'skipped') and info and file_info['new_name']:
-                material_short = (
-                    info['material']
-                    .replace('Intermediate', 'Int')
-                    .replace('Surface', 'Sur')
-                )
-                dest_path = (
-                    Path(dest) / info['project']
-                    / f"{info['jmf']} {material_short}"
-                    / file_info['new_name']
-                )
+                pdf_type = info.get('pdf_type', 'lastrada')
+                if pdf_type == 'jmf_adjustment':
+                    dest_path = (
+                        Path(dest) / info['project']
+                        / 'JMF Adjustments'
+                        / file_info['new_name']
+                    )
+                else:
+                    material_short = (
+                        info['material']
+                        .replace('Intermediate', 'Int')
+                        .replace('Surface', 'Sur')
+                    )
+                    dest_path = (
+                        Path(dest) / info['project']
+                        / f"{info['jmf']} {material_short}"
+                        / file_info['new_name']
+                    )
                 if dest_path.exists():
                     print_path = dest_path
 
@@ -980,30 +1141,62 @@ class FPCProcessorApp:
         # Disable process buttons during run
         self._set_process_buttons('disabled')
         
+        # Process non-pills_rice files first so Lastrada reports are already at the destination
+        # before any Pills & Rice merge attempt (handles the case where both arrive together).
+        def _sort_key(i):
+            pdf_type = (self.files_to_process[i].get('info') or {}).get('pdf_type', 'lastrada')
+            return 1 if pdf_type == 'pills_rice' else 0
+
+        process_order = sorted(range(len(self.files_to_process)), key=_sort_key)
+
         # Process each file using info already extracted during scan/preview
-        for idx, file_info in enumerate(self.files_to_process):
+        for idx in process_order:
+            file_info = self.files_to_process[idx]
             try:
                 if not file_info['selected']:
                     # User deselected this file - leave it as-is in the list
                     pass
                 elif file_info['status'] == 'ready' and file_info['new_name']:
                     info = file_info['info']
+                    pdf_type = info.get('pdf_type') if info else 'lastrada'
 
-                    # Apply same abbreviations used in the filename
-                    material_short = (
-                        info['material']
-                        .replace('Intermediate', 'Int')
-                        .replace('Surface', 'Sur')
-                    )
+                    project_path = Path(dest) / info['project']
+                    if pdf_type == 'jmf_adjustment':
+                        # Plant Testing / Project / JMF Adjustments /
+                        dest_folder_path = project_path / 'JMF Adjustments'
+                        dest_folder_path.mkdir(parents=True, exist_ok=True)
+                        dest_path = dest_folder_path / file_info['new_name']
+                        relative = Path(info['project']) / 'JMF Adjustments' / file_info['new_name']
+                    else:
+                        # Apply same abbreviations used in the filename
+                        material_short = (
+                            info['material']
+                            .replace('Intermediate', 'Int')
+                            .replace('Surface', 'Sur')
+                        )
+                        # Plant Testing / Project / JMF Material /
+                        dest_folder_path = project_path / f"{info['jmf']} {material_short}"
+                        dest_folder_path.mkdir(parents=True, exist_ok=True)
+                        dest_path = dest_folder_path / file_info['new_name']
+                        relative = Path(info['project']) / f"{info['jmf']} {material_short}" / file_info['new_name']
+                        self._ensure_project_subfolders(dest_folder_path)
 
-                    # Build subfolder structure: Plant Testing / Project / JMF Material /
-                    project_folder = Path(dest) / info['project']
-                    mix_folder = project_folder / f"{info['jmf']} {material_short}"
-                    mix_folder.mkdir(parents=True, exist_ok=True)
-
-                    dest_path = mix_folder / file_info['new_name']
-
-                    if dest_path.exists():
+                    if dest_path.exists() and pdf_type == 'pills_rice':
+                        if self._is_already_merged(file_info['path'], dest_path):
+                            file_info['status'] = 'skipped'
+                            self.skipped_count += 1
+                            self.add_log(f"Skipped (already merged): {file_info['new_name']}", "info")
+                        else:
+                            # Merge: append pills & rice pages to the end of the existing report
+                            self._merge_pdfs(dest_path, file_info['path'])
+                            self._record_merge(file_info['path'], dest_path)
+                            file_info['status'] = 'success'
+                            self.success_count += 1
+                            self.add_log(f"Merged: {file_info['name']} -> {relative}", "success")
+                            self._record_stat(file_info, info)
+                            if print_after:
+                                self._print_pdf(dest_path)
+                    elif dest_path.exists():
                         file_info['status'] = 'skipped'
                         self.skipped_count += 1
                         self.add_log(f"Skipped (already exists): {file_info['new_name']}", "info")
@@ -1011,8 +1204,13 @@ class FPCProcessorApp:
                         shutil.copy2(file_info['path'], str(dest_path))
                         file_info['status'] = 'success'
                         self.success_count += 1
-                        relative = Path(info['project']) / f"{info['jmf']} {material_short}" / file_info['new_name']
-                        self.add_log(f"Processed: {file_info['name']} -> {relative}", "success")
+                        if pdf_type == 'pills_rice':
+                            self.add_log(
+                                f"Saved standalone (no matching report found yet): "
+                                f"{file_info['name']} -> {relative}", "info"
+                            )
+                        else:
+                            self.add_log(f"Processed: {file_info['name']} -> {relative}", "success")
                         self._record_stat(file_info, info)
                         if print_after:
                             self._print_pdf(dest_path)
@@ -1241,22 +1439,41 @@ class FPCProcessorApp:
         processed_names = []          # collect successes for the summary notification
         new_error_msgs  = {}          # filename -> short reason, for first-time error notifications
 
+        # Extract info for all new files upfront, then sort so pills_rice is processed last.
+        # This ensures the matching Lastrada report is already at the destination before
+        # any merge attempt when both arrive in the same scan.
+        file_queue = []
         for filename in new_files:
             filepath = os.path.join(source, filename)
             info = self.extract_info_from_pdf(filepath)
+            file_queue.append((filename, filepath, info))
 
-            if not info or not all([
-                info['project'], info['material'], info['jmf'],
-                info['production_day'], info['date'],
-            ]):
+        file_queue.sort(
+            key=lambda x: 1 if (x[2] or {}).get('pdf_type') == 'pills_rice' else 0
+        )
+
+        for filename, filepath, info in file_queue:
+            pdf_type = info.get('pdf_type') if info else None
+
+            # Validate required fields depending on PDF type
+            if pdf_type == 'jmf_adjustment':
+                fields_ok = info and all([info['project'], info['jmf'], info['date']])
+            else:
+                fields_ok = info and all([
+                    info['project'], info['material'], info['jmf'],
+                    info['production_day'], info['date'],
+                ])
+
+            if not fields_ok:
                 missing = []
                 if not info:
                     missing.append("read error")
                 else:
                     if not info['project']:        missing.append("project")
-                    if not info['material']:       missing.append("material")
+                    if pdf_type != 'jmf_adjustment':
+                        if not info['material']:       missing.append("material")
+                        if not info['production_day']: missing.append("production day")
                     if not info['jmf']:            missing.append("JMF")
-                    if not info['production_day']: missing.append("production day")
                     if not info['date']:           missing.append("date")
                 self.add_log(
                     f"[Overwatch] Skipping {filename} — missing: {', '.join(missing)} "
@@ -1269,22 +1486,56 @@ class FPCProcessorApp:
                     new_error_msgs[filename] = f"Missing: {', '.join(missing)}"
                 continue
 
-            # Build the new filename (same logic as manual processing)
-            new_name = (
-                f"{info['project']} {info['material']} {info['jmf']} "
-                f"{info['production_day']} {info['date']}.pdf"
-            )
-            new_name = new_name.replace('Intermediate', 'Int')
-            new_name = new_name.replace('Surface', 'Sur')
-            new_name = re.sub(r'[<>:"|?*]', '_', new_name)
+            # Build the new filename and destination path (same logic as manual processing)
+            project_path = Path(dest) / info['project']
+            if pdf_type == 'jmf_adjustment':
+                new_name = (
+                    f"{info['project']} {info['jmf']} {info['date']} "
+                    f"JMF Adjustment Letter.pdf"
+                )
+                new_name = re.sub(r'[<>:"|?*]', '_', new_name)
+                dest_folder_path = project_path / 'JMF Adjustments'
+                relative = Path(info['project']) / 'JMF Adjustments' / new_name
+            else:
+                new_name = (
+                    f"{info['project']} {info['material']} {info['jmf']} "
+                    f"{info['production_day']} {info['date']}.pdf"
+                )
+                new_name = new_name.replace('Intermediate', 'Int')
+                new_name = new_name.replace('Surface', 'Sur')
+                new_name = re.sub(r'[<>:"|?*]', '_', new_name)
+                material_short = (
+                    info['material']
+                    .replace('Intermediate', 'Int')
+                    .replace('Surface', 'Sur')
+                )
+                dest_folder_path = project_path / f"{info['jmf']} {material_short}"
+                relative = Path(info['project']) / f"{info['jmf']} {material_short}" / new_name
 
-            material_short = (
-                info['material']
-                .replace('Intermediate', 'Int')
-                .replace('Surface', 'Sur')
-            )
-            mix_folder = Path(dest) / info['project'] / f"{info['jmf']} {material_short}"
-            dest_path  = mix_folder / new_name
+            dest_path = dest_folder_path / new_name
+
+            if dest_path.exists() and pdf_type == 'pills_rice':
+                if self._is_already_merged(filepath, dest_path):
+                    # Already merged in a previous session — treat like a normal skip
+                    self._overwatch_done.add(filename)
+                    self.add_log(f"[Overwatch] Skipped (already merged): {new_name}", "info")
+                    self._update_or_add_tree_row(filename, new_name, info, 'skipped', 'SKIPPED')
+                else:
+                    # Merge: append pills & rice pages to the end of the existing report
+                    try:
+                        self._merge_pdfs(dest_path, filepath)
+                        self._record_merge(filepath, dest_path)
+                        self._overwatch_done.add(filename)
+                        self.add_log(f"[Overwatch] Merged: {filename}  ->  {relative}", "success")
+                        self._update_or_add_tree_row(filename, new_name, info, 'success', 'SUCCESS')
+                        self._record_stat({'new_name': new_name}, info)
+                        processed_names.append(new_name)
+                    except Exception as e:
+                        self.add_log(f"[Overwatch] Error merging {filename}: {e}", "error")
+                        self._update_or_add_tree_row(filename, new_name, info, 'error', 'ERROR')
+                        if filename not in self._overwatch_notified_errors:
+                            new_error_msgs[filename] = str(e)
+                continue
 
             if dest_path.exists():
                 self._overwatch_done.add(filename)
@@ -1293,11 +1544,18 @@ class FPCProcessorApp:
                 continue
 
             try:
-                mix_folder.mkdir(parents=True, exist_ok=True)
+                dest_folder_path.mkdir(parents=True, exist_ok=True)
+                if pdf_type != 'jmf_adjustment':
+                    self._ensure_project_subfolders(dest_folder_path)
                 shutil.copy2(filepath, str(dest_path))
                 self._overwatch_done.add(filename)
-                relative = Path(info['project']) / f"{info['jmf']} {material_short}" / new_name
-                self.add_log(f"[Overwatch] Processed: {filename}  ->  {relative}", "success")
+                if pdf_type == 'pills_rice':
+                    self.add_log(
+                        f"[Overwatch] Saved standalone (no matching report found yet): "
+                        f"{filename}  ->  {relative}", "info"
+                    )
+                else:
+                    self.add_log(f"[Overwatch] Processed: {filename}  ->  {relative}", "success")
                 self._update_or_add_tree_row(filename, new_name, info, 'success', 'SUCCESS')
                 self._record_stat({'new_name': new_name}, info)
                 processed_names.append(new_name)

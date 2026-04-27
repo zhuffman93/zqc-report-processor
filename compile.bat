@@ -53,6 +53,9 @@ echo.
     --name "Lastrada_Report_Processor" ^
     --hidden-import "pystray._win32" ^
     --hidden-import "PIL._tkinter_finder" ^
+    --hidden-import "pdfplumber" ^
+    --hidden-import "openpyxl" ^
+    --hidden-import "openpyxl.utils" ^
     --add-data "dist\pdf_filler.exe;." ^
     fpc_processor.py
 

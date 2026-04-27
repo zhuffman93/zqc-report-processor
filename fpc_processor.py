@@ -33,7 +33,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -1774,7 +1774,8 @@ class FPCProcessorApp:
                 latest_tag = data.get("tag_name", "").lstrip("v")
                 for asset in data.get("assets", []):
                     if asset["name"].lower().endswith(".exe"):
-                        asset_url = asset["url"]
+                        asset_url  = asset["url"]
+                        asset_size = asset.get("size", 0)
                         break
 
         except Exception as e:
@@ -1802,7 +1803,7 @@ class FPCProcessorApp:
                     f"has not been attached to the release yet."))
             return
 
-        self.root.after(0, lambda: self._prompt_update(latest_tag, asset_url))
+        self.root.after(0, lambda: self._prompt_update(latest_tag, asset_url, asset_size))
 
     @staticmethod
     def _version_is_newer(latest: str, current: str) -> bool:
@@ -1815,7 +1816,7 @@ class FPCProcessorApp:
         except ValueError:
             return False
 
-    def _prompt_update(self, latest_version: str, asset_url: str):
+    def _prompt_update(self, latest_version: str, asset_url: str, asset_size: int = 0):
         """Show a dialog asking the user if they want to update now."""
         answer = messagebox.askyesno(
             "Update Available",
@@ -1827,11 +1828,14 @@ class FPCProcessorApp:
             icon="info",
         )
         if answer:
-            self._download_and_apply_update(asset_url)
+            self._download_and_apply_update(asset_url, asset_size)
 
-    def _download_and_apply_update(self, asset_url: str):
+    def _download_and_apply_update(self, asset_url: str, expected_size: int = 0):
         """Download the new .exe and swap it in via a batch script that runs
         after this process exits, then restart the application."""
+        current_exe = Path(sys.executable)
+        tmp_exe     = current_exe.with_suffix(".new.exe")
+
         try:
             self.add_log("Downloading update...", "info")
 
@@ -1847,26 +1851,35 @@ class FPCProcessorApp:
                                      f"Please try again later.")
                 return
 
-            # Save the downloaded .exe next to the current .exe with a temp name
-            current_exe = Path(sys.executable)
-            tmp_exe     = current_exe.with_suffix(".new.exe")
-
             with open(tmp_exe, "wb") as fh:
                 for chunk in resp.iter_content(chunk_size=65536):
                     if chunk:
                         fh.write(chunk)
 
+            # Verify the downloaded file is complete before swapping
+            if expected_size > 0:
+                actual_size = tmp_exe.stat().st_size
+                if actual_size != expected_size:
+                    tmp_exe.unlink(missing_ok=True)
+                    messagebox.showerror(
+                        "Update Failed",
+                        f"The download was incomplete ({actual_size:,} of {expected_size:,} bytes).\n"
+                        f"Please check your connection and try again."
+                    )
+                    return
+
             self.add_log("Download complete. Preparing update...", "info")
 
             # Write a small batch script that:
-            #   1. Waits 2 seconds for our process to fully exit
+            #   1. Waits 4 seconds for our process and its PyInstaller temp folder to fully exit
+            #      (2 seconds was not always enough on slower machines)
             #   2. Replaces the current .exe with the downloaded one
             #   3. Restarts the application
             #   4. Deletes itself
             bat_path = current_exe.with_suffix(".update.bat")
             bat_content = (
                 "@echo off\n"
-                "timeout /t 2 /nobreak >nul\n"
+                "timeout /t 4 /nobreak >nul\n"
                 f'move /y "{tmp_exe}" "{current_exe}"\n'
                 f'start "" "{current_exe}"\n'
                 'del "%~f0"\n'
@@ -1886,9 +1899,11 @@ class FPCProcessorApp:
             self.root.destroy()
 
         except Exception as e:
+            # Clean up any partial download so a retry starts fresh
+            tmp_exe.unlink(missing_ok=True)
             messagebox.showerror("Update Failed",
                                  f"An error occurred during the update:\n{e}\n\n"
-                                 f"Please update manually.")
+                                 f"Please try again or update manually.")
 
     # ── Statistics display ─────────────────────────────────────────────────
 

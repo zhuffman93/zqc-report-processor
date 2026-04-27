@@ -33,7 +33,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.4"
+VERSION = "1.0.5"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -181,6 +181,9 @@ class FPCProcessorApp:
         if self.start_in_overwatch.get():
             # Delay slightly so the window is fully rendered before we hide it
             self.root.after(1200, self._auto_start_overwatch)
+
+        # Extract bundled pdf_filler.exe to AppData so Excel workbooks can call it
+        self._extract_pdf_filler()
 
         # Check GitHub for a newer release (runs in background, never blocks startup)
         self._check_for_updates()
@@ -1201,19 +1204,25 @@ class FPCProcessorApp:
                         self.skipped_count += 1
                         self.add_log(f"Skipped (already exists): {file_info['new_name']}", "info")
                     else:
-                        shutil.copy2(file_info['path'], str(dest_path))
-                        file_info['status'] = 'success'
-                        self.success_count += 1
                         if pdf_type == 'pills_rice':
+                            # Never save Pills & Rice standalone — it must merge into an
+                            # existing TE199 report.  If the TE199 hasn't been processed
+                            # yet, leave this file alone so a future rescan can merge it.
+                            file_info['status'] = 'error'
+                            self.error_count += 1
                             self.add_log(
-                                f"Saved standalone (no matching report found yet): "
-                                f"{file_info['name']} -> {relative}", "info"
+                                f"Skipped: {file_info['name']} — no matching TE199 report "
+                                f"found at destination yet. Process the TE199 first, then rescan.",
+                                "error",
                             )
                         else:
+                            shutil.copy2(file_info['path'], str(dest_path))
+                            file_info['status'] = 'success'
+                            self.success_count += 1
                             self.add_log(f"Processed: {file_info['name']} -> {relative}", "success")
-                        self._record_stat(file_info, info)
-                        if print_after:
-                            self._print_pdf(dest_path)
+                            self._record_stat(file_info, info)
+                            if print_after:
+                                self._print_pdf(dest_path)
                 elif file_info['status'] in ('success', 'skipped'):
                     pass  # already handled in a previous run - leave silently
                 else:
@@ -1543,19 +1552,24 @@ class FPCProcessorApp:
                 self._update_or_add_tree_row(filename, new_name, info, 'skipped', 'SKIPPED')
                 continue
 
+            if pdf_type == 'pills_rice':
+                # Never save Pills & Rice standalone — it must merge into an existing
+                # TE199 report.  Leave it out of _overwatch_done so it is retried on
+                # every scan until the matching TE199 has been processed.
+                self.add_log(
+                    f"[Overwatch] {filename} — waiting for matching TE199 report, will retry next scan",
+                    "info",
+                )
+                self._update_or_add_tree_row(filename, new_name, info, 'pending', 'Waiting for TE199')
+                continue
+
             try:
                 dest_folder_path.mkdir(parents=True, exist_ok=True)
                 if pdf_type != 'jmf_adjustment':
                     self._ensure_project_subfolders(dest_folder_path)
                 shutil.copy2(filepath, str(dest_path))
                 self._overwatch_done.add(filename)
-                if pdf_type == 'pills_rice':
-                    self.add_log(
-                        f"[Overwatch] Saved standalone (no matching report found yet): "
-                        f"{filename}  ->  {relative}", "info"
-                    )
-                else:
-                    self.add_log(f"[Overwatch] Processed: {filename}  ->  {relative}", "success")
+                self.add_log(f"[Overwatch] Processed: {filename}  ->  {relative}", "success")
                 self._update_or_add_tree_row(filename, new_name, info, 'success', 'SUCCESS')
                 self._record_stat({'new_name': new_name}, info)
                 processed_names.append(new_name)
@@ -1718,6 +1732,22 @@ class FPCProcessorApp:
         self.root.destroy()
 
     # ── Auto-update methods ────────────────────────────────────────────────
+
+    def _extract_pdf_filler(self):
+        """When running as a compiled .exe, extract the bundled pdf_filler.exe to
+        %APPDATA%\\LastradaReportProcessor\\ so the Excel workbook can call it from
+        a fixed, known path on any machine without needing Python installed."""
+        if not getattr(sys, 'frozen', False):
+            return  # dev mode — nothing to extract
+        try:
+            bundled = Path(sys._MEIPASS) / 'pdf_filler.exe'
+            if not bundled.exists():
+                return
+            target = CONFIG_PATH.parent / 'pdf_filler.exe'
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(bundled), str(target))
+        except Exception:
+            pass  # non-critical — silently ignore if extraction fails
 
     def _check_for_updates(self):
         """Startup auto-check: runs silently in background, only prompts if update found.

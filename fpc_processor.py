@@ -33,7 +33,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.6"
+VERSION = "1.0.7"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -2216,29 +2216,32 @@ class FPCProcessorApp:
 
             self.add_log("Download complete. Preparing update...", "info")
 
-            # Write a small batch script that:
+            # Write a PowerShell script that:
             #   1. Waits 4 seconds for our process and its PyInstaller temp folder to fully exit
-            #      (2 seconds was not always enough on slower machines)
             #   2. Replaces the current .exe with the downloaded one
             #   3. Restarts the application
             #   4. Deletes itself
-            bat_path = current_exe.with_suffix(".update.bat")
-            bat_content = (
-                "@echo off\n"
-                "timeout /t 4 /nobreak >nul\n"
-                f'move /y "{tmp_exe}" "{current_exe}"\n'
-                f'start "" "{current_exe}"\n'
-                'del "%~f0"\n'
+            # PowerShell is used instead of cmd.exe / a .bat file because some endpoint
+            # security products (e.g. Sophos) flag cmd.exe spawned from a user process.
+            ps_path = current_exe.with_suffix(".update.ps1")
+            ps_content = (
+                "Start-Sleep -Seconds 4\n"
+                f'Move-Item -Force "{tmp_exe}" "{current_exe}"\n'
+                f'Start-Process "{current_exe}"\n'
+                f'Remove-Item -Force "{ps_path}" -ErrorAction SilentlyContinue\n'
             )
-            bat_path.write_text(bat_content)
+            ps_path.write_text(ps_content, encoding='utf-8')
 
-            # Launch the batch script as a fully detached process, then quit
+            # Launch the PowerShell script as a fully detached process, then quit
             subprocess.Popen(
-                ["cmd.exe", "/c", str(bat_path)],
-                creationflags=(
-                    subprocess.CREATE_NEW_PROCESS_GROUP |
-                    subprocess.DETACHED_PROCESS
-                ),
+                [
+                    "powershell.exe",
+                    "-NoProfile", "-NonInteractive",
+                    "-WindowStyle", "Hidden",
+                    "-ExecutionPolicy", "Bypass",
+                    "-File", str(ps_path),
+                ],
+                creationflags=subprocess.DETACHED_PROCESS,
                 close_fds=True,
             )
 

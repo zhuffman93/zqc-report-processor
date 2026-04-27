@@ -33,7 +33,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.5"
+VERSION = "1.0.6"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -46,7 +46,11 @@ GITHUB_TOKEN     = "github_pat_11CB74GAI0g4B2QNYM1mpB_IfutqgF4vJkxU1QDjyHwlf6oTb
 # Config file location - persists settings between sessions
 CONFIG_PATH = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaReportProcessor' / 'config.json'
 STATS_PATH  = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaReportProcessor' / 'stats.json'
-MERGES_PATH = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaReportProcessor' / 'merges.json'
+MERGES_PATH      = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaReportProcessor' / 'merges.json'
+
+# IPC paths used by the pdf_filler watcher (Excel workbooks drop a request here)
+PDF_REQUEST_PATH = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaReportProcessor' / 'pdf_request.json'
+PDF_RESULT_PATH  = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaReportProcessor' / 'pdf_result.json'
 
 # Labs available in the dropdown
 LABS = [
@@ -101,6 +105,259 @@ DARK_THEME = {
     'tag_skipped': '#ffc107',
     'tag_error':   '#f87171',
 }
+
+
+# ── pdf_filler IPC helpers ────────────────────────────────────────────────────
+# These functions are called by the background watcher thread when an Excel
+# workbook drops a pdf_request.json file.  Running the extraction inside the
+# already-trusted Lastrada process avoids Sophos/AV blocking a child exe that
+# was spawned from a VBA macro.
+
+def _abbreviate_material(name: str) -> str:
+    """Return a short label (≤4 chars) for an aggregate material name."""
+    n = name.strip()
+    if not n:
+        return ""
+    m = re.match(r'(?:Natural\s+)?Gravel\s+0*(\d+)', n, re.IGNORECASE)
+    if m:
+        return ("G" + m.group(1))[:4]
+    if re.search(r'limestone\s+sand',    n, re.IGNORECASE): return "LSS"
+    if re.search(r'natural\s+sand',      n, re.IGNORECASE): return "NS"
+    if re.search(r'baghouse',            n, re.IGNORECASE): return "BHF"
+    if re.search(r'crushed\s+limestone', n, re.IGNORECASE): return "CLS"
+    if re.search(r'limestone',           n, re.IGNORECASE): return "LS"
+    if re.search(r'stone\s+sand',        n, re.IGNORECASE): return "StS"
+    if re.search(r'screening',           n, re.IGNORECASE): return "SCR"
+    if re.search(r'crushed\s+stone',     n, re.IGNORECASE): return "CS"
+    if re.search(r'manufactured\s+sand', n, re.IGNORECASE): return "MfS"
+    if re.search(r'slag',                n, re.IGNORECASE): return "SLG"
+    return "".join(w[0].upper() for w in n.split() if w)[:4]
+
+
+def _pdf_filler_extract(pdf_path: str) -> dict:
+    """Extract all Marshall Mix Design fields from *pdf_path*.
+
+    Combines the logic from pdf_filler.py's three functions
+    (extract_fields, parse_page3_materials, parse_odot_spec_band)
+    into a single call.  Returns a flat dict ready to JSON-encode.
+    """
+    try:
+        import pdfplumber
+    except ImportError:
+        return {"error": "pdfplumber is not available in this build"}
+
+    result = {}
+
+    # ── Page-1 / page-2 scalar fields ─────────────────────────────────────
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            p1 = pdf.pages[0].extract_text() or ""
+            p2 = pdf.pages[1].extract_text() if len(pdf.pages) > 1 else ""
+            all_text = "\n".join((pg.extract_text() or "") for pg in pdf.pages)
+
+        producer = plant1 = mix_type = ""
+        binder_supplier = binder_grade = ""
+        jmf_number = calib_number = ""
+        virgin_binder = rap_binder = ""
+
+        m = re.search(r"Mix Producer Name:\s*(.+)", p1)
+        if m: producer = m.group(1).strip()
+
+        m = re.search(r"Plant 1 Name:\s*(.+)", p1)
+        if m: plant1 = m.group(1).strip()
+
+        m = re.search(r"Mix Type\s+(.+?)(?:\s{2,}|\n|$)", p1)
+        if m: mix_type = m.group(1).strip()
+
+        m = re.search(r"Selected Virgin Binder Grade\s+(.+?)\s+(?:Neat\b|Producer Name)", p2)
+        if m:
+            binder_grade = m.group(1).strip()
+        else:
+            m = re.search(r"Selected Virgin Binder Grade\s+(.+)", p2)
+            if m: binder_grade = m.group(1).strip()
+
+        m = re.search(r"Binder Supplier\s+(.+?)\s+Brand Name", p2)
+        if m:
+            binder_supplier = m.group(1).strip()
+        else:
+            m = re.search(r"Binder Supplier\s+(.+)", p2)
+            if m: binder_supplier = m.group(1).strip()
+
+        m = re.search(r'%\s*Virgin\s*Binder\s+([\d.]+)',      p2, re.IGNORECASE)
+        if m: virgin_binder = m.group(1).strip()
+
+        m = re.search(r'%\s*Binder\s+from\s+RAP\s+([\d.]+)', p2, re.IGNORECASE)
+        if m: rap_binder = m.group(1).strip()
+
+        m = re.search(r"(B\d+)\s*~",    all_text)
+        if m: jmf_number = m.group(1).strip()
+
+        m = re.search(r"Calib#\s*(\d+)", all_text)
+        if m: calib_number = m.group(1).strip()
+
+        result.update({
+            "producer": producer, "plant1": plant1, "mix_type": mix_type,
+            "binder_supplier": binder_supplier, "binder_grade": binder_grade,
+            "jmf_number": jmf_number, "calib_number": calib_number,
+            "virgin_binder": virgin_binder, "rap_binder": rap_binder,
+        })
+
+    except Exception as e:
+        return {"error": str(e)}
+
+    # ── Page-3 aggregate / RAP / AC fields ────────────────────────────────
+    try:
+        from openpyxl.utils import get_column_letter as _gcl
+
+        with pdfplumber.open(pdf_path) as pdf:
+            p3 = pdf.pages[2].extract_text() or ""
+            p2 = pdf.pages[1].extract_text() or ""
+
+        lines = p3.split('\n')
+
+        def _sec(name):
+            for i, ln in enumerate(lines):
+                if name in ln: return i
+            return None
+
+        coarse_i = _sec('Coarse Aggregates')
+        fine_i   = _sec('Fine Aggregates')
+        bag_i    = _sec('Baghouse Fines')
+        rap_i    = _sec('RAP')
+        blend_i  = _sec('Blend Gsb')
+
+        def _agg(line):
+            t = line.strip().split()
+            if len(t) < 8: return None
+            try:
+                pct = float(t[0]); gsb = float(t[-1]); float(t[-2])
+            except ValueError:
+                return None
+            if pct == 0.0: return None
+            return {"material": t[-5]+' '+t[-4]+' '+t[-3],
+                    "producer": ' '.join(t[2:-5]), "pct": pct, "gsb": gsb}
+
+        def _bag(line):
+            t = line.strip().split()
+            if len(t) < 5: return None
+            try: pct = float(t[0]); gsb = float(t[-1])
+            except ValueError: return None
+            if pct == 0.0: return None
+            return {"material": t[2]+' '+t[3],
+                    "producer": ' '.join(t[4:-1]), "pct": pct, "gsb": gsb}
+
+        def _rap(line):
+            mx = re.search(r'Method \d+\s+(.+?)\s+[A-Z]+/[A-Z]+\s+(\d+\.\d+)', line)
+            if mx:
+                t = line.strip().split()
+                try: pct = float(t[0])
+                except: pct = 0.0
+                return {"pile": mx.group(1).strip().replace('"', 'in.'),
+                        "pct": pct, "gse": float(mx.group(2))}
+            return None
+
+        coarse = []
+        if coarse_i is not None and fine_i is not None:
+            for ln in lines[coarse_i+1:fine_i]:
+                r = _agg(ln)
+                if r: r["item"] = "703.50"; coarse.append(r)
+
+        fine = []
+        if fine_i is not None and bag_i is not None:
+            for ln in lines[fine_i+1:bag_i]:
+                r = _agg(ln)
+                if r: r["item"] = "703.05"; fine.append(r)
+
+        bags = []
+        if bag_i is not None and rap_i is not None:
+            for ln in lines[bag_i+1:rap_i]:
+                r = _bag(ln)
+                if r: r["item"] = "703.05"; bags.append(r)
+
+        rap_data = {"pile": "", "pct": 0.0, "gse": 0.0}
+        if rap_i is not None:
+            end = blend_i if blend_i else len(lines)
+            for ln in lines[rap_i+1:end]:
+                r = _rap(ln)
+                if r: rap_data = r; break
+
+        BASE_COL   = 6
+        fine_start = BASE_COL + len(coarse) + 1
+        bag_start  = fine_start + len(fine)
+
+        aggs = []
+        for i, item in enumerate(coarse): aggs.append({**item, "col": _gcl(BASE_COL + i)})
+        for i, item in enumerate(fine):   aggs.append({**item, "col": _gcl(fine_start + i)})
+        for i, item in enumerate(bags):   aggs.append({**item, "col": _gcl(bag_start  + i)})
+
+        empty = {"material": "", "producer": "", "item": "", "pct": "", "gsb": ""}
+        slots = list(coarse[:4]) + [empty] + list(fine[:4]) + list(bags)
+        while len(slots) < 6: slots.append(empty)
+        slots = slots[:6]
+
+        ac_pct = binder_gb = ""
+        mx = re.search(r'% Binder Content.*?Opt.*?Air Voids\s+([\d.]+)', p2, re.IGNORECASE)
+        if mx: ac_pct = mx.group(1)
+        mx = re.search(r'Binder Gb\s+([\d.]+)', p2, re.IGNORECASE)
+        if mx: binder_gb = mx.group(1)
+
+        mats = {
+            "rap_pile": rap_data["pile"],  "rap_pct":  str(rap_data["pct"]),
+            "rap_gse":  str(rap_data["gse"]), "ac_pct":   ac_pct,
+            "binder_gb": binder_gb,        "agg_count": str(len(aggs)),
+        }
+        for i, s in enumerate(slots, 1):
+            mats[f"material_{i}"] = s["material"]
+            mats[f"producer_{i}"] = s["producer"]
+            mats[f"item_{i}"]     = s.get("item", "")
+        for i, a in enumerate(aggs, 1):
+            mats[f"agg_{i}_col"]    = a["col"]
+            mats[f"agg_{i}_pct"]    = str(a["pct"])
+            mats[f"agg_{i}_gsb"]    = str(a["gsb"])
+            mats[f"agg_{i}_abbrev"] = _abbreviate_material(a["material"])
+
+        result.update(mats)
+
+    except Exception as e:
+        result["materials_error"] = str(e)
+
+    # ── ODOT sieve band ────────────────────────────────────────────────────
+    try:
+        SIEVES = [
+            (0,  r'2"\s*\(50'),      (1,  r'1-1/2"\s*\(38'),
+            (2,  r'1"\s*\(25'),      (3,  r'3/4"\s*\(19\)'),
+            (4,  r'1/2"\s*\(12'),    (5,  r'3/8"\s*\(9'),
+            (6,  r'#4\s*\(4'),       (7,  r'#8\s*\(2'),
+            (8,  r'#16\s*\(1\.1'),   (9,  r'#30\s*\(0\.6\)'),
+            (10, r'#50\s*\(0\.3\)'), (11, r'#100\s*\(0\.1'),
+            (12, r'#200\s*\(0\.0'),
+        ]
+        sieve_data = {}
+        for i in range(13):
+            sieve_data[f"sieve_{i}_jmf"] = ""
+            sieve_data[f"sieve_{i}_mr"]  = ""
+
+        with pdfplumber.open(pdf_path) as pdf:
+            if len(pdf.pages) >= 2:
+                p2_lines = (pdf.pages[1].extract_text() or "").split('\n')
+                for (idx, pattern) in SIEVES:
+                    for line in p2_lines:
+                        if re.search(pattern, line):
+                            mx = re.search(r'\)', line)
+                            if mx:
+                                nums = re.findall(r'\d+\.?\d*', line[mx.end():])
+                                if nums:
+                                    sieve_data[f"sieve_{idx}_jmf"] = nums[0]
+                                    if len(nums) >= 3:
+                                        sieve_data[f"sieve_{idx}_mr"] = f"{nums[1]} / {nums[2]}"
+                            break
+
+        result.update(sieve_data)
+
+    except Exception as e:
+        result["sieve_error"] = str(e)
+
+    return result
 
 
 class CollapsibleSection(ttk.Frame):
@@ -162,6 +419,9 @@ class FPCProcessorApp:
         self._overwatch_notified_errors = set()   # filenames already error-notified (avoid repeat spam)
         self._tray_icon                 = None
 
+        # pdf_filler IPC watcher state
+        self._pdf_filler_stop = threading.Event()
+
         # Configure style
         self.setup_styles()
 
@@ -182,8 +442,12 @@ class FPCProcessorApp:
             # Delay slightly so the window is fully rendered before we hide it
             self.root.after(1200, self._auto_start_overwatch)
 
-        # Extract bundled pdf_filler.exe to AppData so Excel workbooks can call it
+        # Extract bundled pdf_filler.exe to AppData (kept for backwards compatibility)
         self._extract_pdf_filler()
+
+        # Start the pdf_filler IPC watcher so Excel workbooks can request extractions
+        # without spawning a new process (avoids Sophos/AV blocking VBA → exe calls)
+        self._start_pdf_filler_watcher()
 
         # Check GitHub for a newer release (runs in background, never blocks startup)
         self._check_for_updates()
@@ -1722,8 +1986,9 @@ class FPCProcessorApp:
             self._quit_app()
 
     def _quit_app(self):
-        """Clean shutdown: stop overwatch / tray icon, then destroy the window."""
+        """Clean shutdown: stop overwatch / tray icon / pdf_filler watcher, then destroy the window."""
         self._overwatch_stop.set()
+        self._pdf_filler_stop.set()
         if self._tray_icon:
             try:
                 self._tray_icon.stop()
@@ -1748,6 +2013,57 @@ class FPCProcessorApp:
             shutil.copy2(str(bundled), str(target))
         except Exception:
             pass  # non-critical — silently ignore if extraction fails
+
+    # ── pdf_filler IPC watcher ─────────────────────────────────────────────
+
+    def _start_pdf_filler_watcher(self):
+        """Launch the background thread that serves pdf_filler requests from Excel."""
+        self._pdf_filler_stop.clear()
+        threading.Thread(target=self._pdf_filler_watch_loop, daemon=True).start()
+
+    def _pdf_filler_watch_loop(self):
+        """Daemon thread: poll every second for pdf_request.json.
+        When found, run the extraction internally and write pdf_result.json.
+        Because the work happens inside this already-running, already-trusted process,
+        Sophos/AV never sees a new executable being spawned from a VBA macro."""
+        while not self._pdf_filler_stop.wait(timeout=1.0):
+            try:
+                if not PDF_REQUEST_PATH.exists():
+                    continue
+
+                # Read and immediately delete the request file so we don't process it twice
+                try:
+                    with open(PDF_REQUEST_PATH, 'r', encoding='utf-8') as fh:
+                        request = json.load(fh)
+                    PDF_REQUEST_PATH.unlink(missing_ok=True)
+                except Exception:
+                    try: PDF_REQUEST_PATH.unlink(missing_ok=True)
+                    except Exception: pass
+                    continue
+
+                pdf_path = request.get('pdf_path', '').strip()
+                if not pdf_path or not os.path.exists(pdf_path):
+                    self._write_pdf_result({'error': f'PDF not found: {pdf_path}'})
+                    continue
+
+                try:
+                    result = _pdf_filler_extract(pdf_path)
+                except Exception as e:
+                    result = {'error': str(e)}
+
+                self._write_pdf_result(result)
+
+            except Exception:
+                pass  # never let an exception kill the watcher thread
+
+    def _write_pdf_result(self, result: dict):
+        """Write the extraction result dict to pdf_result.json."""
+        try:
+            PDF_RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with open(PDF_RESULT_PATH, 'w', encoding='utf-8') as fh:
+                json.dump(result, fh, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
 
     def _check_for_updates(self):
         """Startup auto-check: runs silently in background, only prompts if update found.

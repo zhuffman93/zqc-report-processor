@@ -33,7 +33,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.7"
+VERSION = "1.0.8"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -2023,15 +2023,24 @@ class FPCProcessorApp:
 
     def _pdf_filler_watch_loop(self):
         """Daemon thread: poll every second for pdf_request.json.
-        When found, run the extraction internally and write pdf_result.json.
-        Because the work happens inside this already-running, already-trusted process,
-        Sophos/AV never sees a new executable being spawned from a VBA macro."""
+
+        Strategy:
+          1. Try the inline _pdf_filler_extract() (pdfplumber bundled in this exe).
+          2. If that fails for any reason, fall back to calling the pdf_filler.exe
+             that was extracted to AppData at startup — it has pdfplumber bundled
+             separately and is guaranteed to have all its dependencies.
+
+        Both paths write pdf_result.json so the Excel workbook always gets a response.
+        All activity is logged to the Lastrada log window for easy diagnosis.
+        """
+        filler_exe = CONFIG_PATH.parent / 'pdf_filler.exe'
+
         while not self._pdf_filler_stop.wait(timeout=1.0):
             try:
                 if not PDF_REQUEST_PATH.exists():
                     continue
 
-                # Read and immediately delete the request file so we don't process it twice
+                # Read and immediately delete the request file
                 try:
                     with open(PDF_REQUEST_PATH, 'r', encoding='utf-8') as fh:
                         request = json.load(fh)
@@ -2042,16 +2051,66 @@ class FPCProcessorApp:
                     continue
 
                 pdf_path = request.get('pdf_path', '').strip()
+                self.root.after(0, lambda p=pdf_path: self.add_log(
+                    f'[PDF Filler] Request received: {os.path.basename(p)}', 'info'))
+
                 if not pdf_path or not os.path.exists(pdf_path):
-                    self._write_pdf_result({'error': f'PDF not found: {pdf_path}'})
+                    err = f'PDF not found: {pdf_path}'
+                    self._write_pdf_result({'error': err})
+                    self.root.after(0, lambda m=err: self.add_log(f'[PDF Filler] {m}', 'error'))
                     continue
 
+                result = None
+                error_msg = None
+
+                # ── Path 1: inline extraction (fast, no subprocess) ────────
                 try:
                     result = _pdf_filler_extract(pdf_path)
+                    if 'error' in result:
+                        raise RuntimeError(result['error'])
+                    self.root.after(0, lambda: self.add_log(
+                        '[PDF Filler] Extraction complete (inline)', 'success'))
                 except Exception as e:
-                    result = {'error': str(e)}
+                    error_msg = str(e)
+                    result = None
 
-                self._write_pdf_result(result)
+                # ── Path 2: fallback to pdf_filler.exe ────────────────────
+                if result is None:
+                    self.root.after(0, lambda m=error_msg: self.add_log(
+                        f'[PDF Filler] Inline failed ({m}), trying pdf_filler.exe…', 'info'))
+                    if filler_exe.exists():
+                        tmp_path = str(PDF_RESULT_PATH.parent / '_pdf_filler_tmp.json')
+                        try:
+                            proc = subprocess.run(
+                                [str(filler_exe), pdf_path, tmp_path],
+                                capture_output=True, timeout=60,
+                                creationflags=subprocess.CREATE_NO_WINDOW,
+                            )
+                            if proc.returncode == 0 and os.path.exists(tmp_path):
+                                with open(tmp_path, 'r', encoding='utf-8') as fh:
+                                    result = json.load(fh)
+                                try: os.unlink(tmp_path)
+                                except Exception: pass
+                                error_msg = None
+                                self.root.after(0, lambda: self.add_log(
+                                    '[PDF Filler] Extraction complete (pdf_filler.exe)', 'success'))
+                            else:
+                                stderr = proc.stderr.decode('utf-8', errors='replace').strip()
+                                error_msg = f'pdf_filler.exe exited {proc.returncode}: {stderr or "no output"}'
+                        except Exception as e2:
+                            error_msg = f'pdf_filler.exe error: {e2}'
+                    else:
+                        error_msg = (
+                            f'pdf_filler.exe not found at {filler_exe}. '
+                            'Try restarting Lastrada Report Processor.'
+                        )
+
+                if error_msg:
+                    self._write_pdf_result({'error': error_msg})
+                    self.root.after(0, lambda m=error_msg: self.add_log(
+                        f'[PDF Filler] Error: {m}', 'error'))
+                else:
+                    self._write_pdf_result(result)
 
             except Exception:
                 pass  # never let an exception kill the watcher thread

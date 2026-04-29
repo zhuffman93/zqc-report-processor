@@ -32,7 +32,8 @@ echo.
     --onefile ^
     --noconsole ^
     --name "pdf_filler" ^
-    --hidden-import "pdfplumber" ^
+    --collect-all "pdfplumber" ^
+    --collect-all "pdfminer" ^
     --hidden-import "openpyxl" ^
     --hidden-import "openpyxl.utils" ^
     pdf_filler.py
@@ -53,7 +54,6 @@ echo.
     --name "Lastrada_Report_Processor" ^
     --hidden-import "pystray._win32" ^
     --hidden-import "PIL._tkinter_finder" ^
-    --hidden-import "pdfplumber" ^
     --hidden-import "openpyxl" ^
     --hidden-import "openpyxl.utils" ^
     --add-data "dist\pdf_filler.exe;." ^

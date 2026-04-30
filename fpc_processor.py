@@ -33,7 +33,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.9"
+VERSION = "1.0.10"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -1997,6 +1997,7 @@ class FPCProcessorApp:
                 self._tray_icon.stop()
             except Exception:
                 pass
+        self.save_config()
         self.root.destroy()
 
     # ── Auto-update methods ────────────────────────────────────────────────
@@ -2014,8 +2015,9 @@ class FPCProcessorApp:
         try:
             current_exe = Path(sys.executable)
             for stale in (
-                current_exe.with_suffix(".update.ps1"),
-                current_exe.with_suffix(".new.exe"),
+                current_exe.with_suffix(".update.ps1"),   # legacy v1.0.8 artifact
+                current_exe.with_suffix(".new.exe"),       # download that failed to swap
+                current_exe.with_suffix(".exe.old"),       # backup left after rename-swap
             ):
                 if stale.exists():
                     try:
@@ -2051,24 +2053,28 @@ class FPCProcessorApp:
     def _pdf_filler_watch_loop(self):
         """Daemon thread: poll every second for pdf_request.json.
 
-        Uses pdf_filler.exe (extracted to AppData at startup) to perform the
-        extraction. That exe has pdfplumber fully self-contained via PyInstaller
-        --collect-all, so it works reliably regardless of what is bundled in
-        the main exe. All activity is logged to the Lastrada log window.
+        Performs the extraction IN-PROCESS via _pdf_filler_extract().  No
+        child process is spawned, which sidesteps Sophos / AV behavioural
+        rules that flag Office macros causing the parent app to spawn
+        children.  pdfplumber is bundled in the main exe via PyInstaller.
+        All activity is logged to the Lastrada log window.
         """
-        filler_exe = CONFIG_PATH.parent / 'pdf_filler.exe'
-
         while not self._pdf_filler_stop.wait(timeout=1.0):
             try:
                 if not PDF_REQUEST_PATH.exists():
                     continue
 
-                # Read and immediately delete the request file
+                # Read and immediately delete the request file.  If we can't
+                # parse it, log the actual exception so we know WHY (this is
+                # invaluable for debugging IPC issues from VBA).
                 try:
                     with open(PDF_REQUEST_PATH, 'r', encoding='utf-8') as fh:
                         request = json.load(fh)
                     PDF_REQUEST_PATH.unlink(missing_ok=True)
-                except Exception:
+                except Exception as parse_err:
+                    parse_err_msg = f'{type(parse_err).__name__}: {parse_err}'
+                    self.root.after(0, lambda m=parse_err_msg: self.add_log(
+                        f'[PDF Filler] IPC parse failed: {m}', 'error'))
                     try: PDF_REQUEST_PATH.unlink(missing_ok=True)
                     except Exception: pass
                     continue
@@ -2083,34 +2089,19 @@ class FPCProcessorApp:
                     self.root.after(0, lambda m=err: self.add_log(f'[PDF Filler] {m}', 'error'))
                     continue
 
+                # Extract IN-PROCESS - no subprocess spawned
                 error_msg = None
                 result    = None
-
-                if not filler_exe.exists():
-                    error_msg = (
-                        f'pdf_filler.exe not found at {filler_exe}. '
-                        'Please restart Lastrada Report Processor.'
-                    )
-                else:
-                    tmp_path = str(PDF_RESULT_PATH.parent / '_pdf_filler_tmp.json')
-                    try:
-                        proc = subprocess.run(
-                            [str(filler_exe), pdf_path, tmp_path],
-                            capture_output=True, timeout=60,
-                            creationflags=subprocess.CREATE_NO_WINDOW,
-                        )
-                        if proc.returncode == 0 and os.path.exists(tmp_path):
-                            with open(tmp_path, 'r', encoding='utf-8') as fh:
-                                result = json.load(fh)
-                            try: os.unlink(tmp_path)
-                            except Exception: pass
-                            self.root.after(0, lambda: self.add_log(
-                                '[PDF Filler] Extraction complete', 'success'))
-                        else:
-                            stderr = proc.stderr.decode('utf-8', errors='replace').strip()
-                            error_msg = f'pdf_filler.exe exited {proc.returncode}: {stderr or "no output"}'
-                    except Exception as e:
-                        error_msg = f'pdf_filler.exe error: {e}'
+                try:
+                    result = _pdf_filler_extract(pdf_path)
+                    if isinstance(result, dict) and 'error' in result and len(result) == 1:
+                        error_msg = str(result['error'])
+                        result = None
+                    else:
+                        self.root.after(0, lambda: self.add_log(
+                            '[PDF Filler] Extraction complete', 'success'))
+                except Exception as e:
+                    error_msg = f'extraction failed: {type(e).__name__}: {e}'
 
                 if error_msg:
                     self._write_pdf_result({'error': error_msg})
@@ -2282,20 +2273,38 @@ class FPCProcessorApp:
 
             self.add_log("Download complete. Preparing update...", "info")
 
-            # Build an inline PowerShell command (no script file written → no artifact):
-            #   1. Wait 10 s so the PyInstaller temp folder finishes releasing file locks
-            #   2. Replace the current .exe with the downloaded one (retry up to 5 times)
-            #   3. Restart the application
-            # Using -Command instead of -File avoids writing a .ps1 file that could be
-            # left behind if the swap fails.
+            # Save settings NOW so dark mode and all other preferences survive
+            # the restart — root.destroy() below bypasses the normal close path.
+            self.save_config()
+
+            # Inline PowerShell swap — no .ps1 file written, no artifact possible.
+            #
+            # Strategy: rename the current exe first (Windows allows renaming a
+            # file that is actively executing — it only blocks overwriting it).
+            # Once the old exe is out of the way, moving the new one in is trivial.
+            #
+            #   1. Sleep 5 s to let PyInstaller temp-folder cleanup finish
+            #   2. Rename current.exe → current.exe.old  (always succeeds on NTFS)
+            #   3. Move   current.new.exe → current.exe   (no lock, no conflict)
+            #   4. Start  current.exe
+            #   5. Delete current.exe.old after a short pause
             cur  = str(current_exe).replace("'", "''")
             tmp  = str(tmp_exe).replace("'", "''")
+            bak  = str(current_exe.with_suffix(".exe.old")).replace("'", "''")
             ps_cmd = (
-                f"Start-Sleep -Seconds 10; "
-                f"$n=0; "
-                f"do {{ $n++; try {{ Move-Item -Force '{tmp}' '{cur}'; break }} "
-                f"catch {{ Start-Sleep -Seconds 2 }} }} while ($n -lt 5); "
-                f"if (Test-Path '{cur}') {{ Start-Process '{cur}' }}"
+                f"Start-Sleep -Seconds 5; "
+                f"try {{ "
+                f"  Rename-Item -Force '{cur}' '{bak}'; "
+                f"  Move-Item   -Force '{tmp}' '{cur}'; "
+                f"  Start-Process '{cur}'; "
+                f"  Start-Sleep -Seconds 3; "
+                f"  Remove-Item '{bak}' -ErrorAction SilentlyContinue "
+                f"}} catch {{ "
+                f"  $n=0; "
+                f"  do {{ $n++; try {{ Move-Item -Force '{tmp}' '{cur}'; break }} "
+                f"    catch {{ Start-Sleep -Seconds 3 }} }} while ($n -lt 5); "
+                f"  if (Test-Path '{cur}') {{ Start-Process '{cur}' }} "
+                f"}}"
             )
 
             subprocess.Popen(
@@ -2371,6 +2380,28 @@ class FPCProcessorApp:
 
 
 def main():
+    # ── Single-instance guard ─────────────────────────────────────────────
+    # CreateMutexW returns a handle; GetLastError() == 183 (ERROR_ALREADY_EXISTS)
+    # means another instance already owns the mutex.  We keep a reference to
+    # the handle so Python's GC doesn't release it before the process exits.
+    import ctypes
+    _mutex_handle = ctypes.windll.kernel32.CreateMutexW(
+        None, True, "Global\\LastradaReportProcessor_v1"
+    )
+    if ctypes.windll.kernel32.GetLastError() == 183:   # ERROR_ALREADY_EXISTS
+        # Build a minimal Tk root just long enough to show the message box,
+        # then exit — avoids the error sound of a bare messagebox on some Windows versions.
+        _tmp = tk.Tk()
+        _tmp.withdraw()
+        messagebox.showwarning(
+            "Already Running",
+            "Lastrada Report Processor is already running.\n\n"
+            "Check your system tray if you don't see the window.",
+            parent=_tmp,
+        )
+        _tmp.destroy()
+        sys.exit(0)
+
     root = tk.Tk()
     app = FPCProcessorApp(root)
     root.mainloop()

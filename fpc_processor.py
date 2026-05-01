@@ -34,7 +34,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.16"
+VERSION = "1.0.17"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -2061,13 +2061,14 @@ class FPCProcessorApp:
                         stale.unlink()
                     except Exception:
                         pass  # locked or already gone — skip silently
-            # Fixed-name temp download file (current mechanism)
-            tmp = exe_dir / "Lastrada_download.tmp"
-            if tmp.exists():
-                try:
-                    tmp.unlink()
-                except Exception:
-                    pass
+            # Fixed-name temp download file and staged installer
+            for stale_name in ("Lastrada_download.tmp", "Lastrada_staged.exe"):
+                stale = exe_dir / stale_name
+                if stale.exists():
+                    try:
+                        stale.unlink()
+                    except Exception:
+                        pass
             # Legacy: .update.ps1 next to the exe (v1.0.8 mechanism)
             ps1 = Path(sys.executable).with_suffix(".update.ps1")
             if ps1.exists():
@@ -2379,7 +2380,9 @@ class FPCProcessorApp:
             self.root.after(0, _do)
 
         def _fail(msg):
+            # Clean up whichever temp file still exists at the time of failure
             tmp_exe.unlink(missing_ok=True)
+            exe_dir.joinpath("Lastrada_staged.exe").unlink(missing_ok=True)
             def _do():
                 if "win" in ui:
                     try:
@@ -2427,46 +2430,101 @@ class FPCProcessorApp:
                     )
                     return
 
-            _set_status("Download complete. Installing…", 100)
+            _set_status("Download complete. Preparing…", 100)
+            time.sleep(0.5)
+
+            # ── Pre-stage: rename .tmp → .exe while still in Python ────────────
+            #
+            # This serves two purposes:
+            #  1. Triggers the antivirus on-access scan NOW, while we can still
+            #     wait for it and show progress (AV was locking the file and
+            #     causing PowerShell's Move-Item to fail after the app closed).
+            #  2. By the time PowerShell runs, the scan is already done so the
+            #     file swap is just two fast Rename-Item calls.
+            #
+            staged_exe = exe_dir / "Lastrada_staged.exe"
+            staged_exe.unlink(missing_ok=True)
+
+            # Rename with brief retry in case AV is already scanning .tmp
+            renamed_to_staged = False
+            for _ in range(10):
+                try:
+                    tmp_exe.rename(staged_exe)
+                    renamed_to_staged = True
+                    break
+                except OSError:
+                    time.sleep(1)
+
+            if not renamed_to_staged:
+                _fail(
+                    "Could not prepare the update file.\n"
+                    "Your antivirus may be scanning it — please try again."
+                )
+                return
+
+            # Wait for AV to finish scanning staged_exe (up to 90 s)
+            _set_status("Waiting for antivirus scan…")
+            scan_start = time.time()
+            scan_done  = False
+            while time.time() - scan_start < 90:
+                try:
+                    with open(staged_exe, "r+b"):   # needs write access = scan finished
+                        scan_done = True
+                        break
+                except (IOError, PermissionError, OSError):
+                    time.sleep(1)
+
+            if not scan_done:
+                _fail(
+                    "Antivirus scan is taking too long (>90 s).\n"
+                    "Please try the update again in a few minutes."
+                )
+                staged_exe.unlink(missing_ok=True)
+                return
+
+            _set_status("Installing…")
             self.root.after(0, lambda: self.add_log(
-                f"v{new_version} downloaded. Launching installer…", "info"))
-            time.sleep(0.8)   # let the user see "100 %" briefly
+                f"v{new_version} staged and scanned. Launching installer…", "info"))
+            time.sleep(0.4)
 
             # Save preferences before closing so they survive the restart
             self.save_config()
 
-            # ── Build PowerShell swap command ──────────────────────────────────
+            # ── PowerShell swap ────────────────────────────────────────────────
             #
-            # KEY FIX: Rename-Item -NewName must receive just the filename,
-            # NOT a full path.  Passing a full path as -NewName silently fails
-            # on many PowerShell versions — that was the root cause of the swap
-            # never completing in v1.0.13/v1.0.14.
+            # AV scan is already done, so this is just two fast renames:
+            #   1. Rename running exe → .bak   (NTFS allows renaming a running exe)
+            #   2. Rename staged.exe  → exe    (no Move-Item, no AV lock risk)
+            #   3a. Launch new exe, clean up .bak
+            #   3b. On failure, restore .bak → exe and relaunch old version
             #
-            cur      = str(current_exe).replace("'", "''")
-            tmp      = str(tmp_exe).replace("'", "''")
-            tgt      = str(target_exe).replace("'", "''")   # same as cur
-            bak      = str(bak_exe).replace("'", "''")
-            log      = str(log_file).replace("'", "''")
-            bak_name = bak_exe.name.replace("'", "''")      # filename only
-            tgt_name = target_exe.name.replace("'", "''")   # filename only
+            # ROOT CAUSE FIX FOR POWERSHELL NOT STARTING:
+            #   A --windowed PyInstaller exe has NULL stdin/stdout/stderr handles.
+            #   subprocess.Popen inherits those NULLs if you don't specify
+            #   redirects, causing PowerShell to crash before running a single
+            #   line.  Fix: pass explicit DEVNULL for all three streams.
+            #
+            cur        = str(current_exe).replace("'", "''")
+            staged     = str(staged_exe).replace("'", "''")
+            tgt        = str(target_exe).replace("'", "''")   # same as cur
+            bak        = str(bak_exe).replace("'", "''")
+            log        = str(log_file).replace("'", "''")
+            bak_name   = bak_exe.name.replace("'", "''")      # filename only — required by -NewName
+            tgt_name   = target_exe.name.replace("'", "''")   # filename only
+            staged_name = staged_exe.name.replace("'", "''")  # filename only
 
             ps_cmd = (
-                # Write a log so we can report success/failure on next startup
                 f"$log = '{log}'; "
                 f"\"Swap started $(Get-Date)\" | Out-File -FilePath $log -Encoding utf8; "
+                f"Start-Sleep -Seconds 2; "
 
-                # Give PyInstaller / AV a moment to release file handles
-                f"Start-Sleep -Seconds 3; "
-
-                # ── Step 1: rename running exe aside ──────────────────────────
-                # NTFS allows renaming a running exe; overwriting it is blocked.
-                # -NewName takes just the new filename (not a full path).
+                # Step 1: rename running exe → .bak
                 f"$renamed = $false; "
-                f"for ($i = 0; $i -lt 5; $i++) {{ "
+                f"for ($i = 0; $i -lt 8; $i++) {{ "
                 f"  try {{ "
                 f"    Rename-Item -LiteralPath '{cur}' -NewName '{bak_name}' -Force; "
                 f"    $renamed = $true; "
-                f"    \"Rename OK (attempt $i)\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                f"    \"Renamed old exe (attempt $i)\" | Out-File -FilePath $log -Append -Encoding utf8; "
                 f"    break "
                 f"  }} catch {{ "
                 f"    \"Rename attempt $i failed: $($_.Exception.Message)\" | Out-File -FilePath $log -Append -Encoding utf8; "
@@ -2474,26 +2532,25 @@ class FPCProcessorApp:
                 f"  }} "
                 f"}}; "
                 f"if (-not $renamed) {{ "
-                f"  \"FATAL: rename failed after 5 attempts\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                f"  \"FATAL: could not rename old exe\" | Out-File -FilePath $log -Append -Encoding utf8; "
                 f"  exit 1 "
                 f"}}; "
 
-                # ── Step 2: move download into place ──────────────────────────
-                # Retry up to 15 × (30 s) to outlast Sophos/Defender on-access scans.
+                # Step 2: rename staged.exe → exe  (AV scan already done in Python)
                 f"$ok = $false; "
-                f"for ($i = 0; $i -lt 15; $i++) {{ "
+                f"for ($i = 0; $i -lt 8; $i++) {{ "
                 f"  try {{ "
-                f"    Move-Item -LiteralPath '{tmp}' -Destination '{tgt}' -Force; "
+                f"    Rename-Item -LiteralPath '{staged}' -NewName '{tgt_name}' -Force; "
                 f"    $ok = $true; "
-                f"    \"Move OK (attempt $i)\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                f"    \"Placed new exe (attempt $i)\" | Out-File -FilePath $log -Append -Encoding utf8; "
                 f"    break "
                 f"  }} catch {{ "
-                f"    \"Move attempt $i failed: $($_.Exception.Message)\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                f"    \"Place attempt $i failed: $($_.Exception.Message)\" | Out-File -FilePath $log -Append -Encoding utf8; "
                 f"    Start-Sleep -Seconds 2 "
                 f"  }} "
                 f"}}; "
 
-                # ── Step 3a: success ──────────────────────────────────────────
+                # Step 3a: success
                 f"if ($ok) {{ "
                 f"  Start-Process -FilePath '{tgt}'; "
                 f"  Start-Sleep -Seconds 3; "
@@ -2501,20 +2558,21 @@ class FPCProcessorApp:
                 f"  \"Update complete\" | Out-File -FilePath $log -Append -Encoding utf8 "
                 f"}} else {{ "
 
-                # ── Step 3b: failure — restore old exe, relaunch it ───────────
-                f"  \"FATAL: move failed after 15 attempts — restoring old exe\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                # Step 3b: failure — restore old exe and relaunch
+                f"  \"FATAL: could not place new exe — restoring old\" | Out-File -FilePath $log -Append -Encoding utf8; "
                 f"  for ($i = 0; $i -lt 5; $i++) {{ "
-                f"    try {{ "
-                f"      Rename-Item -LiteralPath '{bak}' -NewName '{tgt_name}' -Force; "
-                f"      break "
-                f"    }} catch {{ Start-Sleep -Seconds 2 }} "
+                f"    try {{ Rename-Item -LiteralPath '{bak}' -NewName '{tgt_name}' -Force; break }} "
+                f"    catch {{ Start-Sleep -Seconds 2 }} "
                 f"  }}; "
-                f"  Remove-Item -LiteralPath '{tmp}' -ErrorAction SilentlyContinue; "
                 f"  Start-Process -FilePath '{tgt}'; "
-                f"  \"Old version restored and relaunched\" | Out-File -FilePath $log -Append -Encoding utf8 "
+                f"  \"Old version restored\" | Out-File -FilePath $log -Append -Encoding utf8 "
                 f"}}"
             )
 
+            # CRITICAL: explicitly redirect stdin/stdout/stderr to DEVNULL.
+            # A --windowed app has NULL console handles; inheriting them causes
+            # PowerShell to crash immediately (which is why the swap was silently
+            # failing — PowerShell never ran at all).
             subprocess.Popen(
                 [
                     "powershell.exe",
@@ -2523,8 +2581,10 @@ class FPCProcessorApp:
                     "-ExecutionPolicy", "Bypass",
                     "-Command", ps_cmd,
                 ],
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
-                close_fds=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
             )
 
             # Close the progress window then destroy the main window

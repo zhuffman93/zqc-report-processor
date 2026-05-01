@@ -34,7 +34,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.17"
+VERSION = "1.0.18"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -479,9 +479,6 @@ class FPCProcessorApp:
         if self.start_in_overwatch.get():
             # Delay slightly so the window is fully rendered before we hide it
             self.root.after(1200, self._auto_start_overwatch)
-
-        # Extract bundled pdf_filler.exe to AppData (kept for backwards compatibility)
-        self._extract_pdf_filler()
 
         # Clean up any stale update artifacts left by a previous update attempt
         self._cleanup_update_artifacts()
@@ -2098,22 +2095,6 @@ class FPCProcessorApp:
                     pass
         except Exception:
             pass
-
-    def _extract_pdf_filler(self):
-        """When running as a compiled .exe, extract the bundled pdf_filler.exe to
-        %APPDATA%\\LastradaReportProcessor\\ so the Excel workbook can call it from
-        a fixed, known path on any machine without needing Python installed."""
-        if not getattr(sys, 'frozen', False):
-            return  # dev mode — nothing to extract
-        try:
-            bundled = Path(sys._MEIPASS) / 'pdf_filler.exe'
-            if not bundled.exists():
-                return
-            target = CONFIG_PATH.parent / 'pdf_filler.exe'
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(bundled), str(target))
-        except Exception:
-            pass  # non-critical — silently ignore if extraction fails
 
     # ── pdf_filler IPC watcher ─────────────────────────────────────────────
 

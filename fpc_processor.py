@@ -33,7 +33,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.11"
+VERSION = "1.0.12"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -2248,24 +2248,29 @@ class FPCProcessorApp:
 
     def _download_and_apply_update(self, asset_url: str, expected_size: int = 0,
                                      new_version: str = ""):
-        """Download the new .exe, rename it to the versioned name, and swap it in.
+        """Download the new .exe and swap it in place, keeping the same filename.
 
-        The exe on disk is always named  "Lastrada Report Processor v{version}.exe"
-        so users can see which version they have at a glance.  Temp files use a
-        single fixed name (Lastrada_download.tmp) that is easy to identify and
-        cleaned up on startup if it survives a crash.
+        The update replaces the exe at its current path so shortcuts and
+        pinned taskbar items keep working.  Versioned names (e.g.
+        'Lastrada Report Processor v1.0.12.exe') only appear on GitHub
+        release downloads — once installed, the file stays whatever name
+        the user chose.
+
+        Temp files:
+          <exe_dir>\\Lastrada_download.tmp  — download in progress
+          <current_exe_path>.bak            — backup of old exe during swap
+        Both are cleaned up on the next startup if they survive a crash.
         """
         current_exe = Path(sys.executable)
         exe_dir     = current_exe.parent
         tmp_exe     = exe_dir / "Lastrada_download.tmp"
 
-        # The file name the new exe will have once installed
-        ver_label   = new_version or VERSION
-        target_name = f"Lastrada Report Processor v{ver_label}.exe"
-        target_exe  = exe_dir / target_name
+        # The new exe replaces the current one at exactly the same path.
+        target_exe  = current_exe
 
-        # Backup name: same stem as whatever the current exe happens to be called
-        bak_exe     = current_exe.with_suffix(".exe.bak")
+        # Backup: just append ".bak" to the full filename (avoids any
+        # pathlib suffix-validation edge cases with multi-dot extensions).
+        bak_exe     = Path(str(current_exe) + ".bak")
 
         try:
             self.add_log("Downloading update...", "info")
@@ -2305,31 +2310,36 @@ class FPCProcessorApp:
 
             # ── Inline PowerShell swap (no .ps1 file written) ─────────────────
             #
-            #  1. Sleep 5 s — lets PyInstaller temp-folder cleanup finish
-            #  2. Rename current exe → *.exe.bak
-            #     (Windows allows renaming a running exe on NTFS; overwriting is blocked)
-            #  3. Move Lastrada_download.tmp → "Lastrada Report Processor v{ver}.exe"
-            #  4. Start the new versioned exe
-            #  5. Delete the *.exe.bak backup (and the old exe if it differs from target)
+            #  Strategy (safe in-place replacement):
+            #  1. Sleep 5 s — lets PyInstaller finish releasing file locks
+            #  2. Rename current exe → <same_name>.bak
+            #     Windows allows renaming a running exe on NTFS; overwriting is blocked.
+            #  3. Move Lastrada_download.tmp → original exe path (no conflict now)
+            #  4a. SUCCESS: start the new exe, delete the .bak
+            #  4b. FAILURE: rename .bak back to original so the OLD version is still
+            #               launchable — user loses the update but doesn't lose the app
             #
             cur = str(current_exe).replace("'", "''")
             tmp = str(tmp_exe).replace("'", "''")
-            tgt = str(target_exe).replace("'", "''")
+            tgt = str(target_exe).replace("'", "''")   # same as cur
             bak = str(bak_exe).replace("'", "''")
 
             ps_cmd = (
                 f"Start-Sleep -Seconds 5; "
-                f"try {{ "
-                f"  Rename-Item -Force '{cur}' '{bak}'; "
-                f"  Move-Item   -Force '{tmp}' '{tgt}'; "
+                f"$ok = $false; "
+                # Step 1: rename running exe aside (always works on NTFS)
+                f"try {{ Rename-Item -Force '{cur}' '{bak}' }} catch {{ exit 1 }}; "
+                # Step 2: move download into place
+                f"try {{ Move-Item -Force '{tmp}' '{tgt}'; $ok = $true }} catch {{ }}; "
+                # Step 3a: success path
+                f"if ($ok) {{ "
                 f"  Start-Process '{tgt}'; "
                 f"  Start-Sleep -Seconds 3; "
                 f"  Remove-Item '{bak}' -ErrorAction SilentlyContinue "
-                f"}} catch {{ "
-                f"  $n=0; "
-                f"  do {{ $n++; try {{ Move-Item -Force '{tmp}' '{tgt}'; break }} "
-                f"    catch {{ Start-Sleep -Seconds 3 }} }} while ($n -lt 5); "
-                f"  if (Test-Path '{tgt}') {{ Start-Process '{tgt}' }} "
+                f"}} else {{ "
+                # Step 3b: restore old exe so nothing is lost
+                f"  Rename-Item -Force '{bak}' '{cur}' -ErrorAction SilentlyContinue; "
+                f"  Start-Process '{cur}' "
                 f"}}"
             )
 

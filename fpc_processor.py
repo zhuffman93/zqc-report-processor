@@ -33,7 +33,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.13"
+VERSION = "1.0.14"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -167,7 +167,10 @@ def _pdf_filler_extract(pdf_path: str) -> dict:
         if m: plant1 = m.group(1).strip()
 
         m = re.search(r"Mix Type\s+(.+?)(?:\s{2,}|\n|$)", p1)
-        if m: mix_type = m.group(1).strip()
+        if m:
+            mix_type = m.group(1).strip()
+            # Strip parenthetical qualifiers like "(ADTT < 4,000)"
+            mix_type = re.sub(r'\s*\(.*', '', mix_type).strip()
 
         m = re.search(r"Selected Virgin Binder Grade\s+(.+?)\s+(?:Neat\b|Producer Name)", p2)
         if m:
@@ -175,6 +178,10 @@ def _pdf_filler_extract(pdf_path: str) -> dict:
         else:
             m = re.search(r"Selected Virgin Binder Grade\s+(.+)", p2)
             if m: binder_grade = m.group(1).strip()
+        # Extract only the PG grade designation (e.g. "PG 70-22M SBS Dosage..." -> "PG 70-22M")
+        pg_m = re.search(r'(PG\s+\d+-\d+[A-Za-z]*)', binder_grade)
+        if pg_m:
+            binder_grade = pg_m.group(1)
 
         m = re.search(r"Binder Supplier\s+(.+?)\s+Brand Name", p2)
         if m:
@@ -182,6 +189,8 @@ def _pdf_filler_extract(pdf_path: str) -> dict:
         else:
             m = re.search(r"Binder Supplier\s+(.+)", p2)
             if m: binder_supplier = m.group(1).strip()
+        # Strip "Dosage Rate ..." and similar trailing qualifiers
+        binder_supplier = re.sub(r'\s+Dosage\b.*', '', binder_supplier, flags=re.IGNORECASE).strip()
 
         m = re.search(r'%\s*Virgin\s*Binder\s+([\d.]+)',      p2, re.IGNORECASE)
         if m: virgin_binder = m.group(1).strip()
@@ -234,8 +243,22 @@ def _pdf_filler_extract(pdf_path: str) -> dict:
             except ValueError:
                 return None
             if pct == 0.0: return None
-            return {"material": t[-5]+' '+t[-4]+' '+t[-3],
-                    "producer": ' '.join(t[2:-5]), "pct": pct, "gsb": gsb}
+            # Some PDF formats insert an extra bulk-property value (e.g. 100.0, 43.1)
+            # between the material grade and the Gsb values.  Detect it: has a decimal
+            # point AND value > 5.0 (Gsb is 2.0-3.5; grade codes like "057"/"008" have
+            # no decimal point).
+            try:
+                v3 = float(t[-3])
+                has_extra = '.' in t[-3] and v3 > 5.0
+            except (ValueError, IndexError):
+                has_extra = False
+            if has_extra:
+                material = ' '.join(t[-5:-3])   # 2 tokens: type + grade
+                producer  = ' '.join(t[2:-5])
+            else:
+                material = ' '.join(t[-5:-2])   # 3 tokens: qualifier + type + grade
+                producer  = ' '.join(t[2:-5])
+            return {"material": material, "producer": producer, "pct": pct, "gsb": gsb}
 
         def _bag(line):
             t = line.strip().split()
@@ -291,7 +314,9 @@ def _pdf_filler_extract(pdf_path: str) -> dict:
         for i, item in enumerate(bags):   aggs.append({**item, "col": _gcl(bag_start  + i)})
 
         empty = {"material": "", "producer": "", "item": "", "pct": "", "gsb": ""}
-        slots = list(coarse[:4]) + [empty] + list(fine[:4]) + list(bags)
+        # No forced empty separator between coarse and fine — pack consecutively
+        # so mixes with fewer than 4 coarse aggregates don't leave a gap row.
+        slots = list(coarse[:4]) + list(fine[:4]) + list(bags)
         while len(slots) < 6: slots.append(empty)
         slots = slots[:6]
 

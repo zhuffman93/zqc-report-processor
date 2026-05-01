@@ -34,7 +34,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.15"
+VERSION = "1.0.16"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -238,27 +238,39 @@ def _pdf_filler_extract(pdf_path: str) -> dict:
 
         def _agg(line):
             t = line.strip().split()
-            if len(t) < 8: return None
+            if len(t) < 7: return None
             try:
                 pct = float(t[0]); gsb = float(t[-1]); float(t[-2])
             except ValueError:
                 return None
             if pct == 0.0: return None
-            # Some PDF formats insert an extra bulk-property value (e.g. 100.0, 43.1)
-            # between the material grade and the Gsb values.  Detect it: has a decimal
-            # point AND value > 5.0 (Gsb is 2.0-3.5; grade codes like "057"/"008" have
-            # no decimal point).
-            try:
-                v3 = float(t[-3])
-                has_extra = '.' in t[-3] and v3 > 5.0
-            except (ValueError, IndexError):
-                has_extra = False
-            if has_extra:
-                material = ' '.join(t[-5:-3])   # 2 tokens: type + grade
-                producer  = ' '.join(t[2:-5])
+            # Count how many trailing tokens are decimal-point floats.
+            # These are Gsb values (2.0–3.5) and optional bulk-SG (e.g. 43.1,
+            # 100.0).  Grade codes like "008"/"057" have NO decimal, stopping scan.
+            numeric_tail = 0
+            for k in range(len(t) - 1, 1, -1):
+                if '.' in t[k]:
+                    try:
+                        float(t[k]); numeric_tail += 1
+                    except ValueError:
+                        break
+                else:
+                    break
+            mat_end = len(t) - numeric_tail   # index one past last material token
+            if mat_end < 4:
+                return None
+            # grade = last material token; type = second-to-last
+            grade    = t[mat_end - 1]
+            agg_type = t[mat_end - 2]
+            # Optional qualifier ("Natural", "Crushed", …) immediately before type
+            _QUAL = {'natural', 'crushed', 'reclaimed', 'recycled', 'manufactured'}
+            if mat_end >= 3 and t[mat_end - 3].lower() in _QUAL:
+                material  = t[mat_end - 3] + ' ' + agg_type + ' ' + grade
+                mat_start = mat_end - 3
             else:
-                material = ' '.join(t[-5:-2])   # 3 tokens: qualifier + type + grade
-                producer  = ' '.join(t[2:-5])
+                material  = agg_type + ' ' + grade
+                mat_start = mat_end - 2
+            producer = ' '.join(t[2:mat_start])
             return {"material": material, "producer": producer, "pct": pct, "gsb": gsb}
 
         def _bag(line):

@@ -33,7 +33,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.12"
+VERSION = "1.0.13"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -2325,21 +2325,42 @@ class FPCProcessorApp:
             bak = str(bak_exe).replace("'", "''")
 
             ps_cmd = (
+                # 5 s head-start so PyInstaller temp folder and AV get a moment to settle
                 f"Start-Sleep -Seconds 5; "
                 f"$ok = $false; "
-                # Step 1: rename running exe aside (always works on NTFS)
-                f"try {{ Rename-Item -Force '{cur}' '{bak}' }} catch {{ exit 1 }}; "
-                # Step 2: move download into place
-                f"try {{ Move-Item -Force '{tmp}' '{tgt}'; $ok = $true }} catch {{ }}; "
-                # Step 3a: success path
+
+                # ── Step 1: rename running exe aside ──────────────────────────
+                # Windows lets you rename a running exe; overwriting is blocked.
+                # Retry up to 5 × with 2 s gaps (handles brief AV locks).
+                f"$renamed = $false; "
+                f"for ($i=0; $i -lt 5; $i++) {{ "
+                f"  try {{ Rename-Item -Force '{cur}' '{bak}'; $renamed=$true; break }} "
+                f"  catch {{ Start-Sleep -Seconds 2 }} "
+                f"}}; "
+                f"if (-not $renamed) {{ exit 1 }}; "
+
+                # ── Step 2: move download into place ──────────────────────────
+                # Retry up to 15 × with 2 s gaps = up to 30 s total.
+                # This outlasts a typical Sophos/Defender on-access scan of the
+                # newly written file, which is the most common cause of failure.
+                f"for ($i=0; $i -lt 15; $i++) {{ "
+                f"  try {{ Move-Item -Force '{tmp}' '{tgt}'; $ok=$true; break }} "
+                f"  catch {{ Start-Sleep -Seconds 2 }} "
+                f"}}; "
+
+                # ── Step 3a: success ──────────────────────────────────────────
                 f"if ($ok) {{ "
                 f"  Start-Process '{tgt}'; "
                 f"  Start-Sleep -Seconds 3; "
                 f"  Remove-Item '{bak}' -ErrorAction SilentlyContinue "
                 f"}} else {{ "
-                # Step 3b: restore old exe so nothing is lost
-                f"  Rename-Item -Force '{bak}' '{cur}' -ErrorAction SilentlyContinue; "
-                f"  Start-Process '{cur}' "
+
+                # ── Step 3b: failed — restore old exe so nothing is lost ──────
+                f"  for ($i=0; $i -lt 5; $i++) {{ "
+                f"    try {{ Rename-Item -Force '{bak}' '{tgt}'; break }} "
+                f"    catch {{ Start-Sleep -Seconds 2 }} "
+                f"  }}; "
+                f"  Start-Process '{tgt}' "
                 f"}}"
             )
 

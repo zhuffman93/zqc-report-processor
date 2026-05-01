@@ -33,7 +33,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.10"
+VERSION = "1.0.11"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -2005,25 +2005,38 @@ class FPCProcessorApp:
     def _cleanup_update_artifacts(self):
         """Delete any stale files left behind by a previous update attempt.
 
-        Old mechanism wrote a .update.ps1 file next to the exe; new mechanism
-        uses an inline -Command so no script file is created. Either way, a
-        .new.exe can remain if the Move-Item swap succeeded but the old binary
-        was never cleaned up, or if the app crashed before the swap ran.
+        Because the exe can be renamed to a new version on each update, we
+        use directory globs rather than fixed paths so we find artifacts
+        regardless of which version they came from.
         """
         if not getattr(sys, 'frozen', False):
             return  # dev mode — nothing to clean up
         try:
-            current_exe = Path(sys.executable)
-            for stale in (
-                current_exe.with_suffix(".update.ps1"),   # legacy v1.0.8 artifact
-                current_exe.with_suffix(".new.exe"),       # download that failed to swap
-                current_exe.with_suffix(".exe.old"),       # backup left after rename-swap
-            ):
-                if stale.exists():
+            exe_dir = Path(sys.executable).parent
+            # Glob patterns cover any version name:
+            #   *.exe.bak  — old exe renamed aside during swap (current mechanism)
+            #   *.exe.old  — legacy v1.0.10 rename artifact
+            #   *.new.exe  — legacy v1.0.9 temp download name
+            for pattern in ("*.exe.bak", "*.exe.old", "*.new.exe"):
+                for stale in exe_dir.glob(pattern):
                     try:
                         stale.unlink()
                     except Exception:
                         pass  # locked or already gone — skip silently
+            # Fixed-name temp download file (current mechanism)
+            tmp = exe_dir / "Lastrada_download.tmp"
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except Exception:
+                    pass
+            # Legacy: .update.ps1 next to the exe (v1.0.8 mechanism)
+            ps1 = Path(sys.executable).with_suffix(".update.ps1")
+            if ps1.exists():
+                try:
+                    ps1.unlink()
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2231,20 +2244,34 @@ class FPCProcessorApp:
             icon="info",
         )
         if answer:
-            self._download_and_apply_update(asset_url, asset_size)
+            self._download_and_apply_update(asset_url, asset_size, latest_version)
 
-    def _download_and_apply_update(self, asset_url: str, expected_size: int = 0):
-        """Download the new .exe and swap it in via a batch script that runs
-        after this process exits, then restart the application."""
+    def _download_and_apply_update(self, asset_url: str, expected_size: int = 0,
+                                     new_version: str = ""):
+        """Download the new .exe, rename it to the versioned name, and swap it in.
+
+        The exe on disk is always named  "Lastrada Report Processor v{version}.exe"
+        so users can see which version they have at a glance.  Temp files use a
+        single fixed name (Lastrada_download.tmp) that is easy to identify and
+        cleaned up on startup if it survives a crash.
+        """
         current_exe = Path(sys.executable)
-        tmp_exe     = current_exe.with_suffix(".new.exe")
+        exe_dir     = current_exe.parent
+        tmp_exe     = exe_dir / "Lastrada_download.tmp"
+
+        # The file name the new exe will have once installed
+        ver_label   = new_version or VERSION
+        target_name = f"Lastrada Report Processor v{ver_label}.exe"
+        target_exe  = exe_dir / target_name
+
+        # Backup name: same stem as whatever the current exe happens to be called
+        bak_exe     = current_exe.with_suffix(".exe.bak")
 
         try:
             self.add_log("Downloading update...", "info")
 
             headers = {
                 "Authorization": f"Bearer {GITHUB_TOKEN}",
-                # This Accept header tells GitHub to redirect to the actual binary
                 "Accept": "application/octet-stream",
             }
             resp = _requests.get(asset_url, headers=headers, timeout=60, stream=True)
@@ -2259,7 +2286,7 @@ class FPCProcessorApp:
                     if chunk:
                         fh.write(chunk)
 
-            # Verify the downloaded file is complete before swapping
+            # Verify the download is complete before swapping
             if expected_size > 0:
                 actual_size = tmp_exe.stat().st_size
                 if actual_size != expected_size:
@@ -2273,37 +2300,36 @@ class FPCProcessorApp:
 
             self.add_log("Download complete. Preparing update...", "info")
 
-            # Save settings NOW so dark mode and all other preferences survive
-            # the restart — root.destroy() below bypasses the normal close path.
+            # Save settings NOW so dark mode and all preferences survive the restart.
             self.save_config()
 
-            # Inline PowerShell swap — no .ps1 file written, no artifact possible.
+            # ── Inline PowerShell swap (no .ps1 file written) ─────────────────
             #
-            # Strategy: rename the current exe first (Windows allows renaming a
-            # file that is actively executing — it only blocks overwriting it).
-            # Once the old exe is out of the way, moving the new one in is trivial.
+            #  1. Sleep 5 s — lets PyInstaller temp-folder cleanup finish
+            #  2. Rename current exe → *.exe.bak
+            #     (Windows allows renaming a running exe on NTFS; overwriting is blocked)
+            #  3. Move Lastrada_download.tmp → "Lastrada Report Processor v{ver}.exe"
+            #  4. Start the new versioned exe
+            #  5. Delete the *.exe.bak backup (and the old exe if it differs from target)
             #
-            #   1. Sleep 5 s to let PyInstaller temp-folder cleanup finish
-            #   2. Rename current.exe → current.exe.old  (always succeeds on NTFS)
-            #   3. Move   current.new.exe → current.exe   (no lock, no conflict)
-            #   4. Start  current.exe
-            #   5. Delete current.exe.old after a short pause
-            cur  = str(current_exe).replace("'", "''")
-            tmp  = str(tmp_exe).replace("'", "''")
-            bak  = str(current_exe.with_suffix(".exe.old")).replace("'", "''")
+            cur = str(current_exe).replace("'", "''")
+            tmp = str(tmp_exe).replace("'", "''")
+            tgt = str(target_exe).replace("'", "''")
+            bak = str(bak_exe).replace("'", "''")
+
             ps_cmd = (
                 f"Start-Sleep -Seconds 5; "
                 f"try {{ "
                 f"  Rename-Item -Force '{cur}' '{bak}'; "
-                f"  Move-Item   -Force '{tmp}' '{cur}'; "
-                f"  Start-Process '{cur}'; "
+                f"  Move-Item   -Force '{tmp}' '{tgt}'; "
+                f"  Start-Process '{tgt}'; "
                 f"  Start-Sleep -Seconds 3; "
                 f"  Remove-Item '{bak}' -ErrorAction SilentlyContinue "
                 f"}} catch {{ "
                 f"  $n=0; "
-                f"  do {{ $n++; try {{ Move-Item -Force '{tmp}' '{cur}'; break }} "
+                f"  do {{ $n++; try {{ Move-Item -Force '{tmp}' '{tgt}'; break }} "
                 f"    catch {{ Start-Sleep -Seconds 3 }} }} while ($n -lt 5); "
-                f"  if (Test-Path '{cur}') {{ Start-Process '{cur}' }} "
+                f"  if (Test-Path '{tgt}') {{ Start-Process '{tgt}' }} "
                 f"}}"
             )
 
@@ -2322,7 +2348,7 @@ class FPCProcessorApp:
             self.root.destroy()
 
         except Exception as e:
-            # Clean up any partial download so a retry starts fresh
+            # Clean up partial download so a retry starts fresh
             tmp_exe.unlink(missing_ok=True)
             messagebox.showerror("Update Failed",
                                  f"An error occurred during the update:\n{e}\n\n"

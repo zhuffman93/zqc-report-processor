@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tkinter as tk
 import winreg
 from tkinter import filedialog, messagebox, ttk
@@ -33,7 +34,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.14"
+VERSION = "1.0.15"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -2062,6 +2063,26 @@ class FPCProcessorApp:
                     ps1.unlink()
                 except Exception:
                     pass
+            # Read swap log written by the PowerShell updater and report result
+            log_file = exe_dir / "Lastrada_update.log"
+            if log_file.exists():
+                try:
+                    content = log_file.read_text(encoding="utf-8", errors="replace").strip()
+                    log_file.unlink()
+                    if "Update complete" in content:
+                        self.root.after(2500, lambda: self.add_log(
+                            "Update installed successfully.", "info"))
+                    else:
+                        # Something went wrong — show the log so the user knows
+                        self.root.after(2500, lambda c=content: messagebox.showwarning(
+                            "Update Issue",
+                            "The previous update attempt encountered a problem.\n\n"
+                            f"{c}\n\n"
+                            "The old version has been restored. You can try again via\n"
+                            "Settings → Check for Updates, or install manually."
+                        ))
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -2259,133 +2280,226 @@ class FPCProcessorApp:
 
     def _prompt_update(self, latest_version: str, asset_url: str, asset_size: int = 0):
         """Show a dialog asking the user if they want to update now."""
+        size_mb = f"~{asset_size // (1024 * 1024)} MB" if asset_size else "unknown size"
         answer = messagebox.askyesno(
             "Update Available",
             f"A new version of Lastrada Report Processor is available!\n\n"
             f"  Your version:   {VERSION}\n"
-            f"  New version:    {latest_version}\n\n"
+            f"  New version:    {latest_version}\n"
+            f"  Download size:  {size_mb}\n\n"
             f"Download and install now?\n"
             f"(The app will restart automatically after the update.)",
             icon="info",
         )
         if answer:
-            self._download_and_apply_update(asset_url, asset_size, latest_version)
+            threading.Thread(
+                target=self._download_and_apply_update,
+                args=(asset_url, asset_size, latest_version),
+                daemon=True,
+            ).start()
 
     def _download_and_apply_update(self, asset_url: str, expected_size: int = 0,
                                      new_version: str = ""):
-        """Download the new .exe and swap it in place, keeping the same filename.
+        """Download the new .exe and swap it in place.  Runs on a background thread.
 
-        The update replaces the exe at its current path so shortcuts and
-        pinned taskbar items keep working.  Versioned names (e.g.
-        'Lastrada Report Processor v1.0.12.exe') only appear on GitHub
-        release downloads — once installed, the file stays whatever name
-        the user chose.
+        Shows a progress window while downloading.  After the download completes,
+        spawns a detached PowerShell process to perform the file swap (rename running
+        exe aside → move download into place → relaunch), then closes this instance.
 
-        Temp files:
-          <exe_dir>\\Lastrada_download.tmp  — download in progress
-          <current_exe_path>.bak            — backup of old exe during swap
-        Both are cleaned up on the next startup if they survive a crash.
+        Swap strategy (safe in-place replacement on NTFS):
+          1. Rename current exe → <same>.bak  (Windows allows renaming a running exe)
+          2. Move Lastrada_download.tmp → original path  (no conflict now)
+          3a. SUCCESS: Start-Process new exe, delete .bak
+          3b. FAILURE: rename .bak back, relaunch old version — user isn't stranded
+
+        Temp files cleaned on next startup by _cleanup_update_artifacts:
+          Lastrada_download.tmp   — partial / complete download
+          <exe>.bak               — old exe during swap window
+          Lastrada_update.log     — swap result (read and reported on startup)
         """
         current_exe = Path(sys.executable)
         exe_dir     = current_exe.parent
         tmp_exe     = exe_dir / "Lastrada_download.tmp"
+        target_exe  = current_exe                          # in-place replacement
+        bak_exe     = Path(str(current_exe) + ".bak")     # avoids pathlib multi-dot issues
+        log_file    = exe_dir / "Lastrada_update.log"
 
-        # The new exe replaces the current one at exactly the same path.
-        target_exe  = current_exe
+        # ── Progress window (all UI must go through root.after) ───────────────
+        ui = {}
 
-        # Backup: just append ".bak" to the full filename (avoids any
-        # pathlib suffix-validation edge cases with multi-dot extensions).
-        bak_exe     = Path(str(current_exe) + ".bak")
+        def _mk_win():
+            win = tk.Toplevel(self.root)
+            win.title("Updating Lastrada Report Processor")
+            win.geometry("440x155")
+            win.resizable(False, False)
+            win.protocol("WM_DELETE_WINDOW", lambda: None)   # block close while downloading
+            win.grab_set()
 
+            frm = ttk.Frame(win, padding=16)
+            frm.pack(fill="both", expand=True)
+
+            ttk.Label(
+                frm,
+                text=f"Downloading version {new_version}…",
+                font=("Segoe UI", 10, "bold"),
+            ).pack(anchor="w")
+
+            lbl = ttk.Label(frm, text="Connecting…")
+            lbl.pack(anchor="w", pady=(4, 8))
+
+            bar = ttk.Progressbar(frm, length=400, mode="determinate", maximum=100)
+            bar.pack(fill="x")
+
+            ui["win"] = win
+            ui["lbl"] = lbl
+            ui["bar"] = bar
+
+        self.root.after(0, _mk_win)
+        time.sleep(0.3)   # give the window a moment to appear
+
+        # Helpers that post UI updates back to the main thread
+        def _set_status(text, pct=None):
+            def _do():
+                if "lbl" in ui:
+                    ui["lbl"].config(text=text)
+                if pct is not None and "bar" in ui:
+                    ui["bar"]["value"] = pct
+            self.root.after(0, _do)
+
+        def _fail(msg):
+            tmp_exe.unlink(missing_ok=True)
+            def _do():
+                if "win" in ui:
+                    try:
+                        ui["win"].destroy()
+                    except Exception:
+                        pass
+                messagebox.showerror("Update Failed", msg)
+            self.root.after(0, _do)
+
+        # ── Download ──────────────────────────────────────────────────────────
         try:
-            self.add_log("Downloading update...", "info")
-
             headers = {
                 "Authorization": f"Bearer {GITHUB_TOKEN}",
                 "Accept": "application/octet-stream",
             }
             resp = _requests.get(asset_url, headers=headers, timeout=60, stream=True)
             if resp.status_code != 200:
-                messagebox.showerror("Update Failed",
-                                     f"Could not download the update (HTTP {resp.status_code}).\n"
-                                     f"Please try again later.")
+                _fail(
+                    f"Could not download the update (HTTP {resp.status_code}).\n"
+                    f"Please try again later."
+                )
                 return
 
+            downloaded = 0
             with open(tmp_exe, "wb") as fh:
                 for chunk in resp.iter_content(chunk_size=65536):
                     if chunk:
                         fh.write(chunk)
+                        downloaded += len(chunk)
+                        if expected_size > 0:
+                            pct = min(downloaded / expected_size * 100, 99)
+                            mb_done  = downloaded    / 1_048_576
+                            mb_total = expected_size / 1_048_576
+                            _set_status(f"{mb_done:.1f} of {mb_total:.1f} MB downloaded…", pct)
+                        else:
+                            _set_status(f"{downloaded / 1_048_576:.1f} MB downloaded…")
 
-            # Verify the download is complete before swapping
+            # Size check
             if expected_size > 0:
-                actual_size = tmp_exe.stat().st_size
-                if actual_size != expected_size:
-                    tmp_exe.unlink(missing_ok=True)
-                    messagebox.showerror(
-                        "Update Failed",
-                        f"The download was incomplete ({actual_size:,} of {expected_size:,} bytes).\n"
+                actual = tmp_exe.stat().st_size
+                if actual != expected_size:
+                    _fail(
+                        f"Download was incomplete ({actual:,} of {expected_size:,} bytes).\n"
                         f"Please check your connection and try again."
                     )
                     return
 
-            self.add_log("Download complete. Preparing update...", "info")
+            _set_status("Download complete. Installing…", 100)
+            self.root.after(0, lambda: self.add_log(
+                f"v{new_version} downloaded. Launching installer…", "info"))
+            time.sleep(0.8)   # let the user see "100 %" briefly
 
-            # Save settings NOW so dark mode and all preferences survive the restart.
+            # Save preferences before closing so they survive the restart
             self.save_config()
 
-            # ── Inline PowerShell swap (no .ps1 file written) ─────────────────
+            # ── Build PowerShell swap command ──────────────────────────────────
             #
-            #  Strategy (safe in-place replacement):
-            #  1. Sleep 5 s — lets PyInstaller finish releasing file locks
-            #  2. Rename current exe → <same_name>.bak
-            #     Windows allows renaming a running exe on NTFS; overwriting is blocked.
-            #  3. Move Lastrada_download.tmp → original exe path (no conflict now)
-            #  4a. SUCCESS: start the new exe, delete the .bak
-            #  4b. FAILURE: rename .bak back to original so the OLD version is still
-            #               launchable — user loses the update but doesn't lose the app
+            # KEY FIX: Rename-Item -NewName must receive just the filename,
+            # NOT a full path.  Passing a full path as -NewName silently fails
+            # on many PowerShell versions — that was the root cause of the swap
+            # never completing in v1.0.13/v1.0.14.
             #
-            cur = str(current_exe).replace("'", "''")
-            tmp = str(tmp_exe).replace("'", "''")
-            tgt = str(target_exe).replace("'", "''")   # same as cur
-            bak = str(bak_exe).replace("'", "''")
+            cur      = str(current_exe).replace("'", "''")
+            tmp      = str(tmp_exe).replace("'", "''")
+            tgt      = str(target_exe).replace("'", "''")   # same as cur
+            bak      = str(bak_exe).replace("'", "''")
+            log      = str(log_file).replace("'", "''")
+            bak_name = bak_exe.name.replace("'", "''")      # filename only
+            tgt_name = target_exe.name.replace("'", "''")   # filename only
 
             ps_cmd = (
-                # 5 s head-start so PyInstaller temp folder and AV get a moment to settle
-                f"Start-Sleep -Seconds 5; "
-                f"$ok = $false; "
+                # Write a log so we can report success/failure on next startup
+                f"$log = '{log}'; "
+                f"\"Swap started $(Get-Date)\" | Out-File -FilePath $log -Encoding utf8; "
+
+                # Give PyInstaller / AV a moment to release file handles
+                f"Start-Sleep -Seconds 3; "
 
                 # ── Step 1: rename running exe aside ──────────────────────────
-                # Windows lets you rename a running exe; overwriting is blocked.
-                # Retry up to 5 × with 2 s gaps (handles brief AV locks).
+                # NTFS allows renaming a running exe; overwriting it is blocked.
+                # -NewName takes just the new filename (not a full path).
                 f"$renamed = $false; "
-                f"for ($i=0; $i -lt 5; $i++) {{ "
-                f"  try {{ Rename-Item -Force '{cur}' '{bak}'; $renamed=$true; break }} "
-                f"  catch {{ Start-Sleep -Seconds 2 }} "
+                f"for ($i = 0; $i -lt 5; $i++) {{ "
+                f"  try {{ "
+                f"    Rename-Item -LiteralPath '{cur}' -NewName '{bak_name}' -Force; "
+                f"    $renamed = $true; "
+                f"    \"Rename OK (attempt $i)\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                f"    break "
+                f"  }} catch {{ "
+                f"    \"Rename attempt $i failed: $($_.Exception.Message)\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                f"    Start-Sleep -Seconds 2 "
+                f"  }} "
                 f"}}; "
-                f"if (-not $renamed) {{ exit 1 }}; "
+                f"if (-not $renamed) {{ "
+                f"  \"FATAL: rename failed after 5 attempts\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                f"  exit 1 "
+                f"}}; "
 
                 # ── Step 2: move download into place ──────────────────────────
-                # Retry up to 15 × with 2 s gaps = up to 30 s total.
-                # This outlasts a typical Sophos/Defender on-access scan of the
-                # newly written file, which is the most common cause of failure.
-                f"for ($i=0; $i -lt 15; $i++) {{ "
-                f"  try {{ Move-Item -Force '{tmp}' '{tgt}'; $ok=$true; break }} "
-                f"  catch {{ Start-Sleep -Seconds 2 }} "
+                # Retry up to 15 × (30 s) to outlast Sophos/Defender on-access scans.
+                f"$ok = $false; "
+                f"for ($i = 0; $i -lt 15; $i++) {{ "
+                f"  try {{ "
+                f"    Move-Item -LiteralPath '{tmp}' -Destination '{tgt}' -Force; "
+                f"    $ok = $true; "
+                f"    \"Move OK (attempt $i)\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                f"    break "
+                f"  }} catch {{ "
+                f"    \"Move attempt $i failed: $($_.Exception.Message)\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                f"    Start-Sleep -Seconds 2 "
+                f"  }} "
                 f"}}; "
 
                 # ── Step 3a: success ──────────────────────────────────────────
                 f"if ($ok) {{ "
-                f"  Start-Process '{tgt}'; "
+                f"  Start-Process -FilePath '{tgt}'; "
                 f"  Start-Sleep -Seconds 3; "
-                f"  Remove-Item '{bak}' -ErrorAction SilentlyContinue "
+                f"  Remove-Item -LiteralPath '{bak}' -ErrorAction SilentlyContinue; "
+                f"  \"Update complete\" | Out-File -FilePath $log -Append -Encoding utf8 "
                 f"}} else {{ "
 
-                # ── Step 3b: failed — restore old exe so nothing is lost ──────
-                f"  for ($i=0; $i -lt 5; $i++) {{ "
-                f"    try {{ Rename-Item -Force '{bak}' '{tgt}'; break }} "
-                f"    catch {{ Start-Sleep -Seconds 2 }} "
+                # ── Step 3b: failure — restore old exe, relaunch it ───────────
+                f"  \"FATAL: move failed after 15 attempts — restoring old exe\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                f"  for ($i = 0; $i -lt 5; $i++) {{ "
+                f"    try {{ "
+                f"      Rename-Item -LiteralPath '{bak}' -NewName '{tgt_name}' -Force; "
+                f"      break "
+                f"    }} catch {{ Start-Sleep -Seconds 2 }} "
                 f"  }}; "
-                f"  Start-Process '{tgt}' "
+                f"  Remove-Item -LiteralPath '{tmp}' -ErrorAction SilentlyContinue; "
+                f"  Start-Process -FilePath '{tgt}'; "
+                f"  \"Old version restored and relaunched\" | Out-File -FilePath $log -Append -Encoding utf8 "
                 f"}}"
             )
 
@@ -2401,14 +2515,22 @@ class FPCProcessorApp:
                 close_fds=True,
             )
 
-            self.root.destroy()
+            # Close the progress window then destroy the main window
+            def _finish():
+                if "win" in ui:
+                    try:
+                        ui["win"].destroy()
+                    except Exception:
+                        pass
+                self.root.destroy()
 
-        except Exception as e:
-            # Clean up partial download so a retry starts fresh
-            tmp_exe.unlink(missing_ok=True)
-            messagebox.showerror("Update Failed",
-                                 f"An error occurred during the update:\n{e}\n\n"
-                                 f"Please try again or update manually.")
+            self.root.after(500, _finish)
+
+        except Exception as exc:
+            _fail(
+                f"An error occurred during the update:\n{exc}\n\n"
+                f"Please try again or install manually."
+            )
 
     # ── Statistics display ─────────────────────────────────────────────────
 

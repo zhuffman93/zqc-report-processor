@@ -34,7 +34,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.19"
+VERSION = "1.0.20"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -126,6 +126,11 @@ def _abbreviate_material(name: str) -> str:
     if re.search(r'natural\s+sand',      n, re.IGNORECASE): return "NS"
     if re.search(r'baghouse',            n, re.IGNORECASE): return "BHF"
     if re.search(r'crushed\s+limestone', n, re.IGNORECASE): return "CLS"
+    # Grade-specific limestone: "Limestone 008" → "LS8", "Limestone 057" → "L57", etc.
+    m_ls = re.search(r'limestone\s+0*(\d+)', n, re.IGNORECASE)
+    if m_ls:
+        digits = m_ls.group(1)          # leading zeros already stripped by 0*
+        return ('LS' if len(digits) == 1 else 'L') + digits
     if re.search(r'limestone',           n, re.IGNORECASE): return "LS"
     if re.search(r'stone\s+sand',        n, re.IGNORECASE): return "StS"
     if re.search(r'screening',           n, re.IGNORECASE): return "SCR"
@@ -271,6 +276,11 @@ def _pdf_filler_extract(pdf_path: str) -> dict:
                 material  = agg_type + ' ' + grade
                 mat_start = mat_end - 2
             producer = ' '.join(t[2:mat_start])
+            # ── Material name cleanup ──────────────────────────────────────
+            # "Limestone SD5M", "Limestone SD5" → "Limestone Sand"
+            material = re.sub(r'(?i)(limestone)\s+SD\S*', r'\1 Sand', material)
+            # "Natural Sand SD5M", "Natural Sand SD2/SD5" → "Natural Sand"
+            material = re.sub(r'(?i)(Natural\s+Sand)\s+\S+', r'\1', material).strip()
             return {"material": material, "producer": producer, "pct": pct, "gsb": gsb}
 
         def _bag(line):
@@ -318,7 +328,7 @@ def _pdf_filler_extract(pdf_path: str) -> dict:
                 if r: rap_data = r; break
 
         BASE_COL   = 6
-        fine_start = BASE_COL + len(coarse) + 1
+        fine_start = BASE_COL + len(coarse)
         bag_start  = fine_start + len(fine)
 
         aggs = []
@@ -986,21 +996,20 @@ class FPCProcessorApp:
         for item in self.file_tree.get_children():
             self.file_tree.delete(item)
 
-        # Collect matching files (case-insensitive for both name and extension)
+        # Collect all PDF files in the source folder
         pdf_files = [
             f for f in os.listdir(source)
             if f.lower().endswith(".pdf")
         ]
-        pdf_count = len(pdf_files)
 
-        self.list_frame_widget.configure(text=f"Files to Process ({pdf_count})")
-
-        if pdf_count == 0:
+        if not pdf_files:
+            self.list_frame_widget.configure(text="Files to Process (0)")
             self._set_process_buttons('disabled')
             self.add_log("No PDF files found in source folder", "error")
             return
 
-        self.add_log(f"Found {pdf_count} PDF file(s) - extracting previews...", "info")
+        self.list_frame_widget.configure(text="Files to Process (scanning…)")
+        self.add_log(f"Scanning {len(pdf_files)} PDF file(s)...", "info")
         self._set_process_buttons('disabled')
 
         ready_count = 0
@@ -1008,6 +1017,13 @@ class FPCProcessorApp:
             filepath = os.path.join(source, filename)
 
             info = self.extract_info_from_pdf(filepath)
+
+            # Silently skip PDFs that match none of our criteria — not our type of document.
+            # Files with at least one matching field are always shown so the user can see
+            # what's missing.
+            if not self._has_any_criteria(info):
+                self.root.update()
+                continue
 
             new_name = ''
             status_text = 'Pending'
@@ -1065,8 +1081,15 @@ class FPCProcessorApp:
             self.file_tree.insert('', tk.END, values=('[x]', filename, new_name, status_text), tags=(tag,))
             self.root.update()
 
+        shown_count = len(self.files_to_process)
+        self.list_frame_widget.configure(text=f"Files to Process ({shown_count})")
+
+        if shown_count == 0:
+            self.add_log("No matching PDF files found in source folder", "info")
+            return
+
         self.add_log(
-            f"Preview complete: {ready_count} ready, {pdf_count - ready_count} with issues",
+            f"Preview complete: {ready_count} ready, {shown_count - ready_count} with issues",
             "info"
         )
 
@@ -1095,9 +1118,21 @@ class FPCProcessorApp:
             else:
                 return self._extract_lastrada_info(text)
 
-        except Exception as e:
-            self.add_log(f"Error reading PDF: {e}", "error")
+        except Exception:
             return None
+
+    @staticmethod
+    def _has_any_criteria(info) -> bool:
+        """Return True if the extracted info contains at least one recognised field.
+
+        Used to silently skip PDFs that clearly aren't our type of document
+        (e.g. invoices, spec sheets, random office PDFs).  Files that match
+        at least one criterion are always shown even if other fields are missing,
+        so the user can see what went wrong.
+        """
+        if not info:
+            return False
+        return any(info.get(k) for k in ('project', 'material', 'jmf', 'production_day', 'date'))
 
     def _extract_jmf_adjustment_info(self, text):
         """Extract fields from a Mar-Zane JMF Adjustment Letter."""
@@ -1745,8 +1780,6 @@ class FPCProcessorApp:
         if not new_files:
             return
 
-        self.add_log(f"[Overwatch] {len(new_files)} new file(s) found — processing...", "info")
-
         processed_names = []          # collect successes for the summary notification
         new_error_msgs  = {}          # filename -> short reason, for first-time error notifications
 
@@ -1757,11 +1790,23 @@ class FPCProcessorApp:
         for filename in new_files:
             filepath = os.path.join(source, filename)
             info = self.extract_info_from_pdf(filepath)
+
+            # Silently ignore PDFs that don't match any of our criteria — not our
+            # type of document.  Mark as done so they aren't re-checked every cycle.
+            if not self._has_any_criteria(info):
+                self._overwatch_done.add(filename)
+                continue
+
             file_queue.append((filename, filepath, info))
+
+        if not file_queue:
+            return
 
         file_queue.sort(
             key=lambda x: 1 if (x[2] or {}).get('pdf_type') == 'pills_rice' else 0
         )
+
+        self.add_log(f"[Overwatch] {len(file_queue)} new file(s) found — processing...", "info")
 
         for filename, filepath, info in file_queue:
             pdf_type = info.get('pdf_type') if info else None
@@ -1998,12 +2043,11 @@ class FPCProcessorApp:
                 pass  # notifications are non-critical
 
     def _tray_view_log(self, icon=None, item=None):
-        """Show the log window from tray (called from tray thread)."""
+        """Show the log window from tray without restoring the main window."""
         def _do():
-            self.root.deiconify()
-            self.root.lift()
-            self.root.focus_force()
-            self.toggle_log_window()
+            self.log_window.deiconify()
+            self.log_window.lift()
+            self.log_window.focus_force()
         self.root.after(0, _do)
 
     def _tray_open(self, icon=None, item=None):

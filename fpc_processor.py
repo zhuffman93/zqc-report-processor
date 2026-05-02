@@ -34,7 +34,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.18"
+VERSION = "1.0.19"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -429,7 +429,7 @@ class CollapsibleSection(ttk.Frame):
 class FPCProcessorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Lastrada Report Processor")
+        self.root.title("QC Report Processor")
         self.root.geometry("900x700")
         self.root.minsize(700, 600)
         self.root.resizable(True, True)
@@ -1971,18 +1971,19 @@ class FPCProcessorApp:
         image = self._create_tray_image()
         menu  = _pystray.Menu(
             _TrayItem(
-                'Open Lastrada Report Processor',
+                'Open QC Report Processor',
                 self._tray_open,
                 default=True,
             ),
+            _TrayItem('View Log', self._tray_view_log),
             _TrayItem('Stop Overwatch', self._tray_stop),
             _pystray.Menu.SEPARATOR,
             _TrayItem('Exit', self._tray_exit),
         )
         self._tray_icon = _pystray.Icon(
-            'LastradaReportProcessor',
+            'QCReportProcessor',
             image,
-            'Lastrada Report Processor\nOverwatch Active',
+            'QC Report Processor\nOverwatch Active',
             menu,
         )
         threading.Thread(target=self._tray_icon.run, daemon=True).start()
@@ -1995,6 +1996,15 @@ class FPCProcessorApp:
                 self._tray_icon.notify(message, title)
             except Exception:
                 pass  # notifications are non-critical
+
+    def _tray_view_log(self, icon=None, item=None):
+        """Show the log window from tray (called from tray thread)."""
+        def _do():
+            self.root.deiconify()
+            self.root.lift()
+            self.root.focus_force()
+            self.toggle_log_window()
+        self.root.after(0, _do)
 
     def _tray_open(self, icon=None, item=None):
         """Restore main window from tray (called from tray thread)."""
@@ -2167,11 +2177,21 @@ class FPCProcessorApp:
                 pass  # never let an exception kill the watcher thread
 
     def _write_pdf_result(self, result: dict):
-        """Write the extraction result dict to pdf_result.json."""
+        """Write the extraction result dict to pdf_result.json atomically.
+
+        Writes to a .tmp file first, then renames to the final name.  This
+        mirrors the atomic-write pattern in the VBA WriteJSONRequestAtomic
+        sub: the result file only appears in the directory once it is fully
+        written, so VBA's Dir() poll never sees a 0-byte or partially-written
+        file and reads an empty jsonStr.
+        """
         try:
             PDF_RESULT_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(PDF_RESULT_PATH, 'w', encoding='utf-8') as fh:
+            tmp_path = PDF_RESULT_PATH.with_suffix('.tmp')
+            with open(tmp_path, 'w', encoding='utf-8') as fh:
                 json.dump(result, fh, ensure_ascii=False, indent=2)
+            # Atomic rename — only now does VBA's Dir() find the file
+            tmp_path.replace(PDF_RESULT_PATH)
         except Exception:
             pass
 
@@ -2277,7 +2297,7 @@ class FPCProcessorApp:
         size_mb = f"~{asset_size // (1024 * 1024)} MB" if asset_size else "unknown size"
         answer = messagebox.askyesno(
             "Update Available",
-            f"A new version of Lastrada Report Processor is available!\n\n"
+            f"A new version of QC Report Processor is available!\n\n"
             f"  Your version:   {VERSION}\n"
             f"  New version:    {latest_version}\n"
             f"  Download size:  {size_mb}\n\n"
@@ -2323,7 +2343,7 @@ class FPCProcessorApp:
 
         def _mk_win():
             win = tk.Toplevel(self.root)
-            win.title("Updating Lastrada Report Processor")
+            win.title("Updating QC Report Processor")
             win.geometry("440x155")
             win.resizable(False, False)
             win.protocol("WM_DELETE_WINDOW", lambda: None)   # block close while downloading
@@ -2652,7 +2672,7 @@ def main():
         _tmp.withdraw()
         messagebox.showwarning(
             "Already Running",
-            "Lastrada Report Processor is already running.\n\n"
+            "QC Report Processor is already running.\n\n"
             "Check your system tray if you don't see the window.",
             parent=_tmp,
         )

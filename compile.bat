@@ -45,13 +45,13 @@ if errorlevel 1 (
 )
 
 echo.
-echo Step 2 of 2: Compiling "Lastrada Report Processor.exe" ^(with pdf_filler bundled^)...
+echo Step 2 of 2: Compiling "QC Report Processor.exe" ^(with pdf_filler bundled^)...
 echo.
 
 "%VENV%\pyinstaller.exe" ^
     --onefile ^
     --windowed ^
-    --name "Lastrada Report Processor" ^
+    --name "QC Report Processor" ^
     --hidden-import "pystray._win32" ^
     --hidden-import "PIL._tkinter_finder" ^
     --hidden-import "openpyxl" ^
@@ -71,7 +71,7 @@ echo  BUILD SUCCESSFUL
 echo ========================================
 echo.
 echo Executables:
-echo   "dist\Lastrada Report Processor.exe"  (distribute this one)
-echo   dist\pdf_filler.exe                   (bundled inside the above)
+echo   "dist\QC Report Processor.exe"  (distribute this one)
+echo   dist\pdf_filler.exe             (bundled inside the above)
 echo.
 pause

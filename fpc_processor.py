@@ -34,7 +34,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.20"
+VERSION = "1.0.21"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -344,8 +344,21 @@ def _pdf_filler_extract(pdf_path: str) -> dict:
         slots = slots[:6]
 
         ac_pct = binder_gb = ""
-        mx = re.search(r'% Binder Content.*?Opt.*?Air Voids\s+([\d.]+)', p2, re.IGNORECASE)
+        # TE-125 Marshall Mix Design format: "% Binder Content @ Design 4.7"
+        mx = re.search(r'%\s*Binder Content\s*@\s*Design\s+([\d.]+)', p2, re.IGNORECASE)
         if mx: ac_pct = mx.group(1)
+        # TE-199 / Superpave format: multi-line table with Opt Air Voids value
+        if not ac_pct:
+            mx = re.search(r'% Binder Content.*?Opt.*?Air Voids\s+([\d.]+)', p2, re.IGNORECASE | re.DOTALL)
+            if mx: ac_pct = mx.group(1)
+        # Fallback: "Opt. AC" or "Optimum AC" followed by value
+        if not ac_pct:
+            mx = re.search(r'Opt(?:imum)?\.?\s+(?:AC|Asphalt Content)[^=\n]*[=:]\s*([\d.]+)', p2, re.IGNORECASE)
+            if mx: ac_pct = mx.group(1)
+        # Fallback: "% Binder" followed closely by a decimal value on same or next line
+        if not ac_pct:
+            mx = re.search(r'%\s*(?:Binder|AC|Asphalt)[^\n]{0,40}\n?[^\n]{0,20}Opt[^\n]{0,40}([\d]+\.[0-9])', p2, re.IGNORECASE)
+            if mx: ac_pct = mx.group(1)
         mx = re.search(r'Binder Gb\s+([\d.]+)', p2, re.IGNORECASE)
         if mx: binder_gb = mx.group(1)
 

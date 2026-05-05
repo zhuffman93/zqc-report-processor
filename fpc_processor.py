@@ -1,6 +1,7 @@
 """
-Lastrada Report Processor
-Automatically renames and organizes Shelly & Sands Lastrada quality control PDF reports
+QC Report Processor
+Automatically renames and organizes asphalt QC PDF reports
+(Shelly & Sands Lastrada, Mar-Zane JMF Adjustment Letters, Mar-Zane Pills & Rice).
 """
 
 import json
@@ -9,7 +10,6 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import tkinter as tk
@@ -34,14 +34,39 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.22"
+VERSION = "1.0.23"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
 
+# Calibration headers that can leak into the project field when a Lastrada PDF
+# has no recognised project value — used to reject bogus extractions.
+_BAD_PROJECT_RE = re.compile(r'Nuclear\s+Gauge|Serial\s+No|Model\s+No', re.IGNORECASE)
+
+
+def _format_day(val: str) -> str:
+    """Plain integers get the 'Day' prefix (Day1); alphanumerics like 'TB 1' pass through."""
+    return f"Day{val}" if val.isdigit() else val
+
+
+def _sanitize_path_component(s: str) -> str:
+    """Strip path-traversal sequences and Windows-reserved characters from a value
+    that will be used as a folder or filename component. Prevents a malicious PDF
+    with e.g. 'Project: ..\\..\\Windows' from causing writes outside the dest folder."""
+    if not s:
+        return s
+    # Replace path separators and Windows-reserved chars with underscore
+    s = re.sub(r'[\\/:*?"<>|]', '_', s)
+    # Neutralise parent-directory tokens
+    s = s.replace('..', '_')
+    # Windows silently strips trailing dots/spaces from folder names; do it explicitly
+    s = s.strip().strip('.').strip()
+    # Cap length so a giant value can't blow MAX_PATH
+    return s[:100]
+
 # GitHub auto-update settings (private repo, read-only token)
 GITHUB_OWNER     = "zhuffman93"
-GITHUB_REPO_NAME = "lastrada-report-processor"
+GITHUB_REPO_NAME = "zqc-report-processor"
 GITHUB_TOKEN     = "[REDACTED-PAT]"
 
 # Config file location - persists settings between sessions
@@ -53,23 +78,18 @@ MERGES_PATH      = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaRepor
 PDF_REQUEST_PATH = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaReportProcessor' / 'pdf_request.json'
 PDF_RESULT_PATH  = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaReportProcessor' / 'pdf_result.json'
 
-# Labs available in the dropdown
-LABS = [
-    "Lab 1", "Lab 2", "Lab 3", "Lab 4", "Lab 6", "Lab 7", "Lab 8", "Lab 9",
-    "Lab 10", "Lab 12", "Lab 13", "Lab 14", "Lab 17", "Lab 21", "Lab 22",
-    "Lab 23", "Lab 24", "Lab 26", "Lab 27", "Lab 28",
-]
-
-# OneDrive base path - same structure on every machine, only the username differs
-_ONEDRIVE_BASE = (
-    Path.home()
-    / "OneDrive - Shelly & Sands, Inc"
-    / "Mar-Zane Lab - MZ Lab Tech Info"
-    / "Plant Labs"
-)
+# Lab list and OneDrive base path come from local_config.py, which is gitignored
+# so organisation-specific values don't end up in the public source repo.
+# Falls back to harmless generic defaults if the file is missing (e.g. a fresh
+# clone before local_config.py has been created).
+try:
+    from local_config import LABS, ONEDRIVE_BASE
+except ImportError:
+    LABS = ["Lab 1"]
+    ONEDRIVE_BASE = Path.home() / "Documents" / "Reports"
 
 # Destination "Plant Testing" folder for each lab, built dynamically from the user's home directory
-LAB_DESTINATIONS = {lab: str(_ONEDRIVE_BASE / lab / "Plant Testing") for lab in LABS}
+LAB_DESTINATIONS = {lab: str(ONEDRIVE_BASE / lab / "Plant Testing") for lab in LABS}
 
 # Colour themes
 LIGHT_THEME = {
@@ -647,7 +667,7 @@ class FPCProcessorApp:
 
         # Scan button — full width, aligns with entry fields above
         ttk.Button(content,
-                   text="Scan & Preview Lastrada PDFs",
+                   text="Scan & Preview PDFs",
                    command=self.scan_folder).pack(fill=tk.X, pady=(0, 8))
 
         # File list
@@ -993,7 +1013,7 @@ class FPCProcessorApp:
         self.print_selected_btn.configure(state='normal' if any_selected else 'disabled')
 
     def scan_folder(self):
-        """Scan source folder for Shelly & Sands Lastrada PDFs and preview new filenames"""
+        """Scan source folder for QC report PDFs and preview new filenames"""
         source = self.source_folder.get()
 
         if not source:
@@ -1125,11 +1145,18 @@ class FPCProcessorApp:
             text = reader.pages[0].extract_text() or ""
 
             if 'JMF Adjustment Letter' in text:
-                return self._extract_jmf_adjustment_info(text)
+                info = self._extract_jmf_adjustment_info(text)
             elif 'Mar-Zane Lab' in text:
-                return self._extract_pills_rice_info(text)
+                info = self._extract_pills_rice_info(text)
             else:
-                return self._extract_lastrada_info(text)
+                info = self._extract_lastrada_info(text)
+
+            # Sanitize fields used as folder/filename components to prevent path traversal
+            # from malicious PDFs (date is built from regex digits and is already safe)
+            for k in ('project', 'material', 'jmf', 'production_day'):
+                if info.get(k):
+                    info[k] = _sanitize_path_component(info[k])
+            return info
 
         except Exception:
             return None
@@ -1214,8 +1241,7 @@ class FPCProcessorApp:
         # Day Number: 1 / TB 1 / Trial 1 / LH1 — flexible; prepend "Day" only for plain numbers
         m = re.search(r'Day\s+Number:\s*(.+?)(?=\s*(?:Date:|Sample\s+Type:|Test\s+Number:|Ticket)|\n|$)', text, re.IGNORECASE)
         if m:
-            val = m.group(1).strip()
-            info['production_day'] = f"Day{val}" if val.isdigit() else val
+            info['production_day'] = _format_day(m.group(1).strip())
 
         # Date: 04/20/2026
         m = re.search(r'Date:\s*(\d{1,2})/(\d{1,2})/(\d{4})', text, re.IGNORECASE)
@@ -1236,7 +1262,6 @@ class FPCProcessorApp:
         }
 
         # Project: try strict numeric first (136-24, 287-25); fall back to flexible for COC-25, Training, Musk. County
-        _bad_project = re.compile(r'Nuclear\s+Gauge|Serial\s+No|Model\s+No', re.IGNORECASE)
         m = re.search(r'Project:\s*(\d+-\d+)', text, re.IGNORECASE)
         if m:
             info['project'] = m.group(1).strip()
@@ -1250,7 +1275,7 @@ class FPCProcessorApp:
             if m:
                 val = m.group(1).strip()
                 # Reject values that are actually calibration equipment headers, not a project name
-                info['project'] = '' if _bad_project.search(val) else val
+                info['project'] = '' if _BAD_PROJECT_RE.search(val) else val
 
         # Material: XXmm Intermediate/Surface  (stop before "Quantity(")
         m = re.search(r'Material:\s*([^\n]+?)(?:\s+Quantity\s*\(|$)', text, re.IGNORECASE)
@@ -1265,8 +1290,7 @@ class FPCProcessorApp:
         # Production Day: 1 / TB 1 / Trial 1 / LH1 — flexible; prepend "Day" only for plain numbers
         m = re.search(r'Production\s+Day:\s*(.+?)(?=\s*(?:Date\s+(?:Tested|Sampled):)|\n|$)', text, re.IGNORECASE)
         if m:
-            val = m.group(1).strip()
-            info['production_day'] = f"Day{val}" if val.isdigit() else val
+            info['production_day'] = _format_day(m.group(1).strip())
 
         # Date Tested / Date Sampled: MM/DD/YYYY
         m = re.search(r'Date\s+(?:Tested|Sampled):\s*(\d{1,2})/(\d{1,2})/(\d{4})', text, re.IGNORECASE)

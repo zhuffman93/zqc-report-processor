@@ -19,3 +19,8 @@ env/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Local deployment config — organisation-specific lab list and paths.
+# Bundled into the built .exe but kept out of source control.
+# See local_config.example.py for the template.
+local_config.py

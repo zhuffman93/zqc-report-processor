@@ -34,7 +34,7 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.21"
+VERSION = "1.0.22"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -1159,10 +1159,14 @@ class FPCProcessorApp:
             'production_day': '',
         }
 
-        # Project: 254-25
-        m = re.search(r'Project:\s*(\S+)', text, re.IGNORECASE)
+        # Project: try strict numeric first (254-25); fall back to flexible for COC-25, Training, Musk. County
+        m = re.search(r'Project:\s*(\d+-\d+)', text, re.IGNORECASE)
         if m:
             info['project'] = m.group(1).strip()
+        else:
+            m = re.search(r'Project:\s*(.+?)(?=\s*(?:JMF\s*=|Date:)|\n|$)', text, re.IGNORECASE)
+            if m:
+                info['project'] = m.group(1).strip()
 
         # JMF = B240868
         m = re.search(r'JMF\s*=\s*(B\d+)', text, re.IGNORECASE)
@@ -1187,8 +1191,8 @@ class FPCProcessorApp:
             'date':          '',
         }
 
-        # Project Number: 287-25
-        m = re.search(r'Project\s+Number:\s*(\S+)', text, re.IGNORECASE)
+        # Project Number: flexible (287-25, COC-25, Training, Musk. County) — stop before next known field or newline
+        m = re.search(r'Project\s+Number:\s*(.+?)(?=\s*(?:JMF\s+Number:|Mix\s+Type:|Day\s+Number:|Date:|Sample\s+Type:|Test\s+Number:)|\n|$)', text, re.IGNORECASE)
         if m:
             info['project'] = m.group(1).strip()
 
@@ -1207,10 +1211,11 @@ class FPCProcessorApp:
         if m:
             info['material'] = ' '.join(m.group(1).split())
 
-        # Day Number: 1
-        m = re.search(r'Day\s+Number:\s*(\d+)', text, re.IGNORECASE)
+        # Day Number: 1 / TB 1 / Trial 1 / LH1 — flexible; prepend "Day" only for plain numbers
+        m = re.search(r'Day\s+Number:\s*(.+?)(?=\s*(?:Date:|Sample\s+Type:|Test\s+Number:|Ticket)|\n|$)', text, re.IGNORECASE)
         if m:
-            info['production_day'] = f"Day{m.group(1).strip()}"
+            val = m.group(1).strip()
+            info['production_day'] = f"Day{val}" if val.isdigit() else val
 
         # Date: 04/20/2026
         m = re.search(r'Date:\s*(\d{1,2})/(\d{1,2})/(\d{4})', text, re.IGNORECASE)
@@ -1230,10 +1235,22 @@ class FPCProcessorApp:
             'date':          '',
         }
 
-        # Project: X-XX
+        # Project: try strict numeric first (136-24, 287-25); fall back to flexible for COC-25, Training, Musk. County
+        _bad_project = re.compile(r'Nuclear\s+Gauge|Serial\s+No|Model\s+No', re.IGNORECASE)
         m = re.search(r'Project:\s*(\d+-\d+)', text, re.IGNORECASE)
         if m:
             info['project'] = m.group(1).strip()
+        else:
+            # Flexible fallback: capture until next known field label, calibration header, or newline
+            m = re.search(
+                r'Project:\s*(.+?)(?=\s*(?:Material:|JMF:|Production\s+Day:|Date\s+(?:Tested|Sampled):'
+                r'|Quantity\s*\(|Nuclear\s+Gauge|Serial\s+No|Model\s+No)|\n|$)',
+                text, re.IGNORECASE
+            )
+            if m:
+                val = m.group(1).strip()
+                # Reject values that are actually calibration equipment headers, not a project name
+                info['project'] = '' if _bad_project.search(val) else val
 
         # Material: XXmm Intermediate/Surface  (stop before "Quantity(")
         m = re.search(r'Material:\s*([^\n]+?)(?:\s+Quantity\s*\(|$)', text, re.IGNORECASE)
@@ -1245,10 +1262,11 @@ class FPCProcessorApp:
         if m:
             info['jmf'] = m.group(1).strip()
 
-        # Production Day: X
-        m = re.search(r'Production\s+Day:\s*(\d+)', text, re.IGNORECASE)
+        # Production Day: 1 / TB 1 / Trial 1 / LH1 — flexible; prepend "Day" only for plain numbers
+        m = re.search(r'Production\s+Day:\s*(.+?)(?=\s*(?:Date\s+(?:Tested|Sampled):)|\n|$)', text, re.IGNORECASE)
         if m:
-            info['production_day'] = f"Day{m.group(1).strip()}"
+            val = m.group(1).strip()
+            info['production_day'] = f"Day{val}" if val.isdigit() else val
 
         # Date Tested / Date Sampled: MM/DD/YYYY
         m = re.search(r'Date\s+(?:Tested|Sampled):\s*(\d{1,2})/(\d{1,2})/(\d{4})', text, re.IGNORECASE)

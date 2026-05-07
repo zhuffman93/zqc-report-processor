@@ -30,11 +30,16 @@ try:
 except ImportError:
     _pystray = None  # tray icon not available; overwatch still works without it
 
+try:
+    import psutil as _psutil
+except ImportError:
+    _psutil = None  # bootloader-PID lookup falls back to a fixed sleep
+
 from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.24"
+VERSION = "1.0.25"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
@@ -77,10 +82,11 @@ def _sanitize_path_component(s: str) -> str:
     # Cap length so a giant value can't blow MAX_PATH
     return s[:100]
 
-# GitHub auto-update settings (private repo, read-only token)
+# GitHub auto-update settings — repo is public so no auth token is bundled.
+# Release downloads use the unauthenticated GitHub API (60 req/hour per IP,
+# plenty for a once-per-startup or once-per-6-hour update check).
 GITHUB_OWNER     = "zhuffman93"
 GITHUB_REPO_NAME = "zqc-report-processor"
-GITHUB_TOKEN     = "[REDACTED-PAT]"
 
 # Config file location - persists settings between sessions
 CONFIG_PATH = Path(os.environ.get('APPDATA', Path.home())) / 'LastradaReportProcessor' / 'config.json'
@@ -2424,13 +2430,12 @@ class FPCProcessorApp:
                 f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO_NAME}/releases/latest"
             )
             headers = {
-                "Authorization": f"Bearer {GITHUB_TOKEN}",
                 "Accept": "application/vnd.github+json",
             }
             resp = _requests.get(api_url, headers=headers, timeout=10)
 
-            if resp.status_code == 401:
-                error_msg = "Authentication failed (HTTP 401).\nThe update token may have expired or been revoked."
+            if resp.status_code == 403:
+                error_msg = "GitHub API rate limit reached.\nPlease try again in an hour."
             elif resp.status_code == 404:
                 error_msg = "No releases found on GitHub yet."
             elif resp.status_code != 200:
@@ -2626,7 +2631,6 @@ class FPCProcessorApp:
         # ── Download ──────────────────────────────────────────────────────────
         try:
             headers = {
-                "Authorization": f"Bearer {GITHUB_TOKEN}",
                 "Accept": "application/octet-stream",
             }
             resp = _requests.get(asset_url, headers=headers, timeout=60, stream=True)
@@ -2760,31 +2764,42 @@ class FPCProcessorApp:
             # updates so it relaunches directly into the tray (no window flash).
             relaunch_args = f" -ArgumentList '{RELAUNCH_OVERWATCH_FLAG}'" if silent else ""
 
-            # Old PID — PowerShell waits for this process to fully exit before
-            # touching any files.  This eliminates the race where the new exe's
-            # PyInstaller _MEI extraction collides with the old exe's _MEI
-            # cleanup (cause of the "Failed to load Python DLL" error).
-            old_pid = os.getpid()
+            # Find the PyInstaller bootloader PID — that's the *parent* of this
+            # Python child process.  The bootloader is what holds the running
+            # .exe handle and runs the _MEI cleanup; we must wait for *it* to
+            # exit, not the Python child.  os.getpid() gives the child only.
+            # If psutil is unavailable, fall back to a long fixed sleep.
+            bootloader_pid = None
+            if _psutil is not None:
+                try:
+                    bootloader_pid = _psutil.Process(os.getpid()).ppid()
+                except Exception:
+                    bootloader_pid = None
+
+            if bootloader_pid:
+                wait_block = (
+                    f"$bootPid = {bootloader_pid}; "
+                    f"$waited = 0; "
+                    f"while ((Get-Process -Id $bootPid -ErrorAction SilentlyContinue) -and ($waited -lt 60)) {{ "
+                    f"  Start-Sleep -Milliseconds 500; "
+                    f"  $waited++ "
+                    f"}}; "
+                    f"\"Bootloader exited after $($waited * 0.5)s\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                    # Brief grace period for Windows to finish releasing the
+                    # original .exe file handle after the bootloader exits.
+                    f"Start-Sleep -Milliseconds 1500; "
+                )
+            else:
+                # Conservative fallback when psutil isn't available
+                wait_block = (
+                    f"\"psutil unavailable — using fixed 10s wait\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                    f"Start-Sleep -Seconds 10; "
+                )
 
             ps_cmd = (
                 f"$log = '{log}'; "
                 f"\"Swap started $(Get-Date)\" | Out-File -FilePath $log -Encoding utf8; "
-
-                # Wait for the old process to fully exit (max 30s safety cap).
-                # While the old PyInstaller process is alive its _MEI temp
-                # folder is still in use; launching the new exe before then
-                # races the old cleanup and intermittently fails to load
-                # python.dll.
-                f"$oldPid = {old_pid}; "
-                f"$waited = 0; "
-                f"while ((Get-Process -Id $oldPid -ErrorAction SilentlyContinue) -and ($waited -lt 60)) {{ "
-                f"  Start-Sleep -Milliseconds 500; "
-                f"  $waited++ "
-                f"}}; "
-                f"\"Old process gone after $($waited * 0.5)s\" | Out-File -FilePath $log -Append -Encoding utf8; "
-                # Brief grace period to let Windows finish releasing file
-                # handles after the process exits.
-                f"Start-Sleep -Milliseconds 750; "
+                f"{wait_block}"
 
                 # Step 1: rename running exe → .bak
                 f"$renamed = $false; "

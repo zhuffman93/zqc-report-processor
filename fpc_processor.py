@@ -34,10 +34,23 @@ from PIL import Image as _PILImage, ImageDraw as _PILDraw
 
 
 # App version — bump this string before publishing a new GitHub release
-VERSION = "1.0.23"
+VERSION = "1.0.24"
 
 # How often (seconds) the Overwatch mode scans the source folder for new files
 OVERWATCH_INTERVAL = 30
+
+# How often (milliseconds) the app checks GitHub for a new release while in
+# Overwatch mode.  6 hours by default — enough to keep installs fresh without
+# hitting the API constantly.
+OVERWATCH_UPDATE_CHECK_MS = 6 * 60 * 60 * 1000
+
+# Max time (seconds) to wait for an in-flight scan to finish before applying a
+# silent update.  If a scan is genuinely stuck, the update goes ahead anyway.
+SILENT_UPDATE_IDLE_WAIT = 60
+
+# CLI flag passed to the new instance after a silent in-Overwatch update so it
+# launches directly into Overwatch without flashing the main window.
+RELAUNCH_OVERWATCH_FLAG = "--overwatch"
 
 # Calibration headers that can leak into the project field when a Lastrada PDF
 # has no recognised project value — used to reject bogus extractions.
@@ -88,8 +101,13 @@ except ImportError:
     LABS = ["Lab 1"]
     ONEDRIVE_BASE = Path.home() / "Documents" / "Reports"
 
-# Destination "Plant Testing" folder for each lab, built dynamically from the user's home directory
-LAB_DESTINATIONS = {lab: str(ONEDRIVE_BASE / lab / "Plant Testing") for lab in LABS}
+# Destination "Plant Testing" folder for each lab, built dynamically from the user's home directory.
+# The dropdown label (e.g. "Lab 3") differs from the actual folder name on disk
+# (e.g. "Lab-3") — folders use a hyphen instead of a space.
+LAB_DESTINATIONS = {
+    lab: str(ONEDRIVE_BASE / lab.replace(" ", "-") / "Plant Testing")
+    for lab in LABS
+}
 
 # Colour themes
 LIGHT_THEME = {
@@ -491,6 +509,14 @@ class FPCProcessorApp:
         # Startup preference flags
         self.start_in_overwatch = tk.BooleanVar(value=False)
         self.run_on_startup     = tk.BooleanVar(value=False)
+        # When True, the periodic update check in Overwatch will silently
+        # download and install new releases without prompting.
+        self.auto_install_updates = tk.BooleanVar(value=True)
+
+        # True if this instance was relaunched by a silent update — used to
+        # suppress dialogs (use tray notifications instead) and to skip the
+        # 1.7-second window-flash that the normal Overwatch start does.
+        self._launched_in_overwatch = (RELAUNCH_OVERWATCH_FLAG in sys.argv)
 
         # Overwatch state
         self.overwatch_mode = False
@@ -499,6 +525,11 @@ class FPCProcessorApp:
         self._overwatch_done            = set()   # source filenames successfully handled
         self._overwatch_notified_errors = set()   # filenames already error-notified (avoid repeat spam)
         self._tray_icon                 = None
+        # True while _overwatch_scan_and_process is actually working through
+        # files — silent updates wait for this to clear before swapping the exe.
+        self._processing_active = False
+        # Handle for the scheduled periodic update check; None when not scheduled.
+        self._update_check_after_id = None
 
         # pdf_filler IPC watcher state
         self._pdf_filler_stop = threading.Event()
@@ -518,8 +549,14 @@ class FPCProcessorApp:
         # Hide to tray (not quit) when X is clicked while Overwatch is running
         self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
 
-        # Auto-start Overwatch if the user has that preference set
-        if self.start_in_overwatch.get():
+        # Auto-start Overwatch if the user has that preference set, OR if this
+        # instance was relaunched by a silent in-Overwatch update.
+        if self._launched_in_overwatch:
+            # Hide immediately so the window never flashes during the relaunch
+            self.root.withdraw()
+            # Run as soon as mainloop starts — no need for the cosmetic delay
+            self.root.after(0, self._auto_start_overwatch)
+        elif self.start_in_overwatch.get():
             # Delay slightly so the window is fully rendered before we hide it
             self.root.after(1200, self._auto_start_overwatch)
 
@@ -579,6 +616,11 @@ class FPCProcessorApp:
             command=self._on_startup_prefs_changed,
         )
         settings_menu.add_separator()
+        settings_menu.add_checkbutton(
+            label="Auto-install updates in Overwatch",
+            variable=self.auto_install_updates,
+            command=self._on_startup_prefs_changed,
+        )
         settings_menu.add_command(label="Check for Updates", command=self.check_for_updates_manual)
         settings_menu.add_separator()
         settings_menu.add_command(label="View Log", command=self.toggle_log_window)
@@ -942,8 +984,9 @@ class FPCProcessorApp:
             'source_folder':      str(Path.home() / 'Downloads'),
             'dest_folder':        '',
             'dark_mode':          False,
-            'start_in_overwatch': False,
-            'run_on_startup':     False,
+            'start_in_overwatch':   False,
+            'run_on_startup':       False,
+            'auto_install_updates': True,
         }
         config = defaults.copy()
 
@@ -974,6 +1017,7 @@ class FPCProcessorApp:
         # Restore startup preferences (checkboxes only — overwatch auto-start happens in __init__)
         self.start_in_overwatch.set(config['start_in_overwatch'])
         self.run_on_startup.set(config['run_on_startup'])
+        self.auto_install_updates.set(config['auto_install_updates'])
 
     def save_config(self):
         """Save current settings to config file"""
@@ -984,8 +1028,9 @@ class FPCProcessorApp:
                 'source_folder':      self.source_folder.get(),
                 'dest_folder':        self.dest_folder.get(),
                 'dark_mode':          self.dark_mode,
-                'start_in_overwatch': self.start_in_overwatch.get(),
-                'run_on_startup':     self.run_on_startup.get(),
+                'start_in_overwatch':   self.start_in_overwatch.get(),
+                'run_on_startup':       self.run_on_startup.get(),
+                'auto_install_updates': self.auto_install_updates.get(),
             }
             with open(CONFIG_PATH, 'w') as f:
                 json.dump(config, f, indent=2)
@@ -1775,10 +1820,44 @@ class FPCProcessorApp:
         )
         self._overwatch_thread.start()
 
+        # While in Overwatch, periodically check GitHub for new releases.
+        # Skipped when running as a .py script — only the compiled .exe updates.
+        if getattr(sys, 'frozen', False):
+            self._schedule_overwatch_update_check()
+
+    def _schedule_overwatch_update_check(self):
+        """Schedule the next periodic update check OVERWATCH_UPDATE_CHECK_MS from now."""
+        self._update_check_after_id = self.root.after(
+            OVERWATCH_UPDATE_CHECK_MS, self._overwatch_periodic_update_check
+        )
+
+    def _overwatch_periodic_update_check(self):
+        """Fires every OVERWATCH_UPDATE_CHECK_MS while Overwatch is active.
+        If auto-install is enabled, downloads and applies updates silently."""
+        self._update_check_after_id = None
+        if not self.overwatch_mode:
+            return
+        if self.auto_install_updates.get() and _requests is not None:
+            threading.Thread(
+                target=self._update_check_worker,
+                kwargs={'silent': True, 'auto_install': True},
+                daemon=True,
+            ).start()
+        # Reschedule for the next interval regardless of outcome
+        self._schedule_overwatch_update_check()
+
     def _stop_overwatch(self):
         """Deactivate Overwatch: stop background thread and restore the window."""
         self.overwatch_mode = False
         self._overwatch_stop.set()
+
+        # Cancel any pending periodic update check
+        if self._update_check_after_id is not None:
+            try:
+                self.root.after_cancel(self._update_check_after_id)
+            except Exception:
+                pass
+            self._update_check_after_id = None
 
         # Remove tray icon
         if self._tray_icon:
@@ -1814,7 +1893,16 @@ class FPCProcessorApp:
         Does NOT print (printing is always a deliberate user action)."""
         if not self.overwatch_mode:
             return
+        # Set the idle-gate flag so a silent update waits for us to finish
+        self._processing_active = True
+        try:
+            self._overwatch_scan_and_process_inner()
+        finally:
+            self._processing_active = False
 
+    def _overwatch_scan_and_process_inner(self):
+        """Inner body of _overwatch_scan_and_process; wrapped so the idle-gate
+        flag is reliably cleared even if processing raises."""
         source = self.source_folder.get()
         dest   = self.dest_folder.get()
 
@@ -2318,11 +2406,14 @@ class FPCProcessorApp:
             target=self._update_check_worker, kwargs={'silent': False}, daemon=True
         ).start()
 
-    def _update_check_worker(self, silent: bool = True):
+    def _update_check_worker(self, silent: bool = True, auto_install: bool = False):
         """Background thread: call the GitHub releases API and act on the result.
 
-        silent=True  — startup auto-check: swallow all errors, only show dialog if update found.
-        silent=False — manual check: always show a result dialog (update / up-to-date / error).
+        silent=True       — swallow errors; only act if an update is found.
+        silent=False      — show result dialogs for update / up-to-date / error.
+        auto_install=True — when an update is found, download and apply it
+                            silently (no confirm dialog, no progress window).
+                            Used by the periodic in-Overwatch update check.
         """
         error_msg   = None
         latest_tag  = None
@@ -2378,6 +2469,19 @@ class FPCProcessorApp:
                     f"has not been attached to the release yet."))
             return
 
+        # Auto-install path (periodic check in Overwatch): skip the prompt, kick
+        # off the silent download/swap immediately on a background thread.
+        if auto_install:
+            self.root.after(0, lambda: self.add_log(
+                f"Auto-installing update v{latest_tag}…", "info"))
+            threading.Thread(
+                target=self._download_and_apply_update,
+                args=(asset_url, asset_size, latest_tag),
+                kwargs={'silent': True},
+                daemon=True,
+            ).start()
+            return
+
         self.root.after(0, lambda: self._prompt_update(latest_tag, asset_url, asset_size))
 
     @staticmethod
@@ -2412,12 +2516,21 @@ class FPCProcessorApp:
             ).start()
 
     def _download_and_apply_update(self, asset_url: str, expected_size: int = 0,
-                                     new_version: str = ""):
+                                     new_version: str = "", silent: bool = False):
         """Download the new .exe and swap it in place.  Runs on a background thread.
 
-        Shows a progress window while downloading.  After the download completes,
-        spawns a detached PowerShell process to perform the file swap (rename running
-        exe aside → move download into place → relaunch), then closes this instance.
+        silent=False — interactive mode: shows a Toplevel progress window and
+                       a messagebox on failure.  Used for manual / startup-prompt
+                       updates while the user is actively using the app.
+        silent=True  — silent mode: no Toplevel, no dialogs.  Logs progress to
+                       the log window and uses tray notifications for the final
+                       result.  Waits for any in-flight Overwatch scan to finish
+                       (idle gate) before swapping the exe.  Relaunches the new
+                       instance directly into Overwatch.
+
+        After the download completes, spawns a detached PowerShell process to
+        perform the file swap (rename running exe aside → move download into
+        place → relaunch), then closes this instance.
 
         Swap strategy (safe in-place replacement on NTFS):
           1. Rename current exe → <same>.bak  (Windows allows renaming a running exe)
@@ -2438,6 +2551,8 @@ class FPCProcessorApp:
         log_file    = exe_dir / "Lastrada_update.log"
 
         # ── Progress window (all UI must go through root.after) ───────────────
+        # In silent mode the Toplevel is skipped entirely — status goes to the
+        # log window instead, and tray notifications report the final result.
         ui = {}
 
         def _mk_win():
@@ -2467,11 +2582,19 @@ class FPCProcessorApp:
             ui["lbl"] = lbl
             ui["bar"] = bar
 
-        self.root.after(0, _mk_win)
-        time.sleep(0.3)   # give the window a moment to appear
+        if not silent:
+            self.root.after(0, _mk_win)
+            time.sleep(0.3)   # give the window a moment to appear
 
         # Helpers that post UI updates back to the main thread
         def _set_status(text, pct=None):
+            if silent:
+                # Silent mode: only log meaningful state changes (skip the
+                # noisy per-chunk progress updates) so the log doesn't fill up
+                if pct is None or pct >= 100:
+                    self.root.after(0, lambda t=text: self.add_log(
+                        f"[Auto-update] {t}", "info"))
+                return
             def _do():
                 if "lbl" in ui:
                     ui["lbl"].config(text=text)
@@ -2483,6 +2606,14 @@ class FPCProcessorApp:
             # Clean up whichever temp file still exists at the time of failure
             tmp_exe.unlink(missing_ok=True)
             exe_dir.joinpath("Lastrada_staged.exe").unlink(missing_ok=True)
+            if silent:
+                # Silent failure: log + tray notification, no modal dialog
+                self.root.after(0, lambda m=msg: self.add_log(
+                    f"[Auto-update] FAILED: {m}", "error"))
+                self.root.after(0, lambda: self._tray_notify(
+                    "Update Failed",
+                    "The auto-update could not be installed.\nSee the log for details."))
+                return
             def _do():
                 if "win" in ui:
                     try:
@@ -2587,6 +2718,18 @@ class FPCProcessorApp:
                 f"v{new_version} staged and scanned. Launching installer…", "info"))
             time.sleep(0.4)
 
+            # Idle gate: in silent mode, don't yank the rug out from under an
+            # in-flight Overwatch scan.  Wait up to SILENT_UPDATE_IDLE_WAIT
+            # seconds for the current scan to finish; if it's truly stuck,
+            # proceed anyway (the swap is safe — files in flight just retry
+            # on next launch).
+            if silent and self._processing_active:
+                self.root.after(0, lambda: self.add_log(
+                    "[Auto-update] Waiting for in-flight scan to finish…", "info"))
+                wait_start = time.time()
+                while self._processing_active and (time.time() - wait_start) < SILENT_UPDATE_IDLE_WAIT:
+                    time.sleep(0.5)
+
             # Save preferences before closing so they survive the restart
             self.save_config()
 
@@ -2613,10 +2756,35 @@ class FPCProcessorApp:
             tgt_name   = target_exe.name.replace("'", "''")   # filename only
             staged_name = staged_exe.name.replace("'", "''")  # filename only
 
+            # Pass --overwatch to the new instance for silent in-Overwatch
+            # updates so it relaunches directly into the tray (no window flash).
+            relaunch_args = f" -ArgumentList '{RELAUNCH_OVERWATCH_FLAG}'" if silent else ""
+
+            # Old PID — PowerShell waits for this process to fully exit before
+            # touching any files.  This eliminates the race where the new exe's
+            # PyInstaller _MEI extraction collides with the old exe's _MEI
+            # cleanup (cause of the "Failed to load Python DLL" error).
+            old_pid = os.getpid()
+
             ps_cmd = (
                 f"$log = '{log}'; "
                 f"\"Swap started $(Get-Date)\" | Out-File -FilePath $log -Encoding utf8; "
-                f"Start-Sleep -Seconds 2; "
+
+                # Wait for the old process to fully exit (max 30s safety cap).
+                # While the old PyInstaller process is alive its _MEI temp
+                # folder is still in use; launching the new exe before then
+                # races the old cleanup and intermittently fails to load
+                # python.dll.
+                f"$oldPid = {old_pid}; "
+                f"$waited = 0; "
+                f"while ((Get-Process -Id $oldPid -ErrorAction SilentlyContinue) -and ($waited -lt 60)) {{ "
+                f"  Start-Sleep -Milliseconds 500; "
+                f"  $waited++ "
+                f"}}; "
+                f"\"Old process gone after $($waited * 0.5)s\" | Out-File -FilePath $log -Append -Encoding utf8; "
+                # Brief grace period to let Windows finish releasing file
+                # handles after the process exits.
+                f"Start-Sleep -Milliseconds 750; "
 
                 # Step 1: rename running exe → .bak
                 f"$renamed = $false; "
@@ -2650,9 +2818,11 @@ class FPCProcessorApp:
                 f"  }} "
                 f"}}; "
 
-                # Step 3a: success
+                # Step 3a: success — relaunch new exe.  In silent mode pass
+                # --overwatch so the new instance comes back into Overwatch
+                # without flashing the main window.
                 f"if ($ok) {{ "
-                f"  Start-Process -FilePath '{tgt}'; "
+                f"  Start-Process -FilePath '{tgt}'{relaunch_args}; "
                 f"  Start-Sleep -Seconds 3; "
                 f"  Remove-Item -LiteralPath '{bak}' -ErrorAction SilentlyContinue; "
                 f"  \"Update complete\" | Out-File -FilePath $log -Append -Encoding utf8 "
@@ -2664,7 +2834,7 @@ class FPCProcessorApp:
                 f"    try {{ Rename-Item -LiteralPath '{bak}' -NewName '{tgt_name}' -Force; break }} "
                 f"    catch {{ Start-Sleep -Seconds 2 }} "
                 f"  }}; "
-                f"  Start-Process -FilePath '{tgt}'; "
+                f"  Start-Process -FilePath '{tgt}'{relaunch_args}; "
                 f"  \"Old version restored\" | Out-File -FilePath $log -Append -Encoding utf8 "
                 f"}}"
             )
@@ -2687,7 +2857,14 @@ class FPCProcessorApp:
                 creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
             )
 
-            # Close the progress window then destroy the main window
+            # Close the progress window then destroy the main window.  In
+            # silent mode briefly notify the tray so the user knows an update
+            # happened (otherwise the swap would be entirely invisible).
+            if silent:
+                self._tray_notify(
+                    "QC Report Processor Updated",
+                    f"Installing v{new_version}…  Restarting now.",
+                )
             def _finish():
                 if "win" in ui:
                     try:

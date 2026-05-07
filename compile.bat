@@ -56,6 +56,7 @@ echo.
     --hidden-import "PIL._tkinter_finder" ^
     --hidden-import "openpyxl" ^
     --hidden-import "openpyxl.utils" ^
+    --hidden-import "psutil" ^
     --add-data "dist\pdf_filler.exe;." ^
     fpc_processor.py
 

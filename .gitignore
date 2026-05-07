@@ -24,3 +24,7 @@ Thumbs.db
 # Bundled into the built .exe but kept out of source control.
 # See local_config.example.py for the template.
 local_config.py
+
+# One-shot credential file used during a release push (deleted after each run).
+# Should never be present, but ignored as a safety net.
+.gh_token
